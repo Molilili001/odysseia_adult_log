@@ -22,6 +22,27 @@ from discord.ext import tasks
 
 LOG = logging.getLogger("audit-archiver")
 DISCORD_EPOCH_MS = 1_420_070_400_000
+
+
+def bounded_env_int(
+    name: str,
+    default: int,
+    *,
+    minimum: int,
+    maximum: Optional[int] = None,
+) -> int:
+    raw = os.getenv(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer; got {raw!r}") from exc
+    if value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}; got {raw!r}")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{name} must be <= {maximum}; got {raw!r}")
+    return value
+
+
 DB_PATH = Path(os.getenv("AUDIT_DB", "audit_logs.db"))
 STAGING_BATCH_SIZE = max(
     1, min(50, int(os.getenv("AUDIT_STAGING_BATCH_SIZE", "50")))
@@ -30,12 +51,25 @@ STAGING_FLUSH_SECONDS = 0.2
 STAGING_ADMISSION_TIMEOUT_SECONDS = 1.0
 STAGING_WRITE_RETRIES = 5
 STAGING_CONSUME_SIZE = 500
-SYNC_INTERVAL_MINUTES = max(
-    1, int(os.getenv("AUDIT_SYNC_INTERVAL_MINUTES", "10"))
+STATS_CACHE_SECONDS = 60.0
+RETENTION_PRUNE_BATCH_SIZE = 1000
+SYNC_INTERVAL_MINUTES = bounded_env_int(
+    "AUDIT_SYNC_INTERVAL_MINUTES", 10, minimum=1, maximum=1440
 )
-REPLAY_OVERLAP_SECONDS = int(os.getenv("AUDIT_REPLAY_OVERLAP_SECONDS", "300"))
+REPLAY_OVERLAP_SECONDS = bounded_env_int(
+    "AUDIT_REPLAY_OVERLAP_SECONDS", 300, minimum=0, maximum=86400
+)
+AUDIT_RETENTION_DAYS = bounded_env_int(
+    "AUDIT_RETENTION_DAYS", 0, minimum=0
+)
+AUDIT_VACUUM_AFTER_PRUNE = os.getenv(
+    "AUDIT_VACUUM_AFTER_PRUNE", "false"
+).strip().lower() in {"1", "true", "yes", "on"}
+STAGING_BACKLOG_WARN = bounded_env_int(
+    "AUDIT_STAGING_BACKLOG_WARN", 50000, minimum=1
+)
 SQLITE_SYNCHRONOUS = os.getenv("SQLITE_SYNCHRONOUS", "FULL").upper()
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 COMMAND_SYNC_MODE = os.getenv("AUDIT_COMMAND_SYNC_MODE", "none").strip().lower()
 ALLOW_VIEW_AUDIT_LOG_PERMISSION = os.getenv(
     "AUDIT_ALLOW_VIEW_LOG_PERMISSION", "false"
@@ -107,6 +141,30 @@ CREATE TABLE IF NOT EXISTS staging_entries (
 );
 CREATE INDEX IF NOT EXISTS idx_staging_scan
     ON staging_entries(staging_id);
+
+CREATE TABLE IF NOT EXISTS audit_dead_letters (
+    guild_id        INTEGER NOT NULL,
+    entry_id        INTEGER NOT NULL,
+    source          TEXT NOT NULL,
+    error_type      TEXT,
+    error_text      TEXT,
+    first_seen_at_ms INTEGER NOT NULL,
+    last_seen_at_ms INTEGER NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (guild_id, entry_id, source)
+);
+"""
+
+DEAD_LETTER_UPSERT_SQL = """
+INSERT INTO audit_dead_letters (
+    guild_id, entry_id, source, error_type, error_text,
+    first_seen_at_ms, last_seen_at_ms, attempts
+) VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+ON CONFLICT(guild_id, entry_id, source) DO UPDATE SET
+    error_type = excluded.error_type,
+    error_text = excluded.error_text,
+    last_seen_at_ms = excluded.last_seen_at_ms,
+    attempts = audit_dead_letters.attempts + 1;
 """
 
 UPSERT_SQL = """
@@ -172,6 +230,27 @@ class AuditRow:
 
 
 @dataclass(frozen=True, slots=True)
+class DeadLetter:
+    guild_id: int
+    entry_id: int
+    source: str
+    error_type: str
+    error_text: str
+    seen_at_ms: int
+
+    def values(self) -> tuple[Any, ...]:
+        return (
+            self.guild_id,
+            self.entry_id,
+            self.source,
+            self.error_type,
+            self.error_text,
+            self.seen_at_ms,
+            self.seen_at_ms,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class StagingConsumeResult:
     consumed_count: int
     invalid_count: int
@@ -194,6 +273,13 @@ def now_ms() -> int:
     return time.time_ns() // 1_000_000
 
 
+def checked_sqlite_int(value: Any, field: str) -> int:
+    converted = int(value)
+    if not -(2**63) <= converted <= 2**63 - 1:
+        raise OverflowError(f"{field} is outside SQLite's integer range")
+    return converted
+
+
 def staged_payload_to_row(
     guild_id: int,
     entry_id: int,
@@ -203,16 +289,34 @@ def staged_payload_to_row(
     payload = json.loads(payload_json)
     if not isinstance(payload, dict):
         raise ValueError("staging payload must be a JSON object")
-    if int(payload["guild_id"]) != guild_id or int(payload["entry_id"]) != entry_id:
+    guild_id = checked_sqlite_int(guild_id, "guild_id")
+    entry_id = checked_sqlite_int(entry_id, "entry_id")
+    received_at_ms = checked_sqlite_int(received_at_ms, "received_at_ms")
+    if (
+        checked_sqlite_int(payload["guild_id"], "payload.guild_id") != guild_id
+        or checked_sqlite_int(payload["entry_id"], "payload.entry_id") != entry_id
+    ):
         raise ValueError("staging payload identifiers do not match its columns")
+    reason = payload.get("reason")
+    if reason is not None and not isinstance(reason, str):
+        raise TypeError("staging reason must be a string or null")
+    user_id = payload.get("user_id")
+    target_id = payload.get("target_id")
     return AuditRow(
         guild_id=guild_id,
         entry_id=entry_id,
-        action_type=int(payload["action_type"]),
-        user_id=None if payload.get("user_id") is None else int(payload["user_id"]),
-        target_id=None if payload.get("target_id") is None else int(payload["target_id"]),
-        created_at_ms=int(payload.get("created_at_ms", snowflake_ms(entry_id))),
-        reason=payload.get("reason"),
+        action_type=checked_sqlite_int(payload["action_type"], "action_type"),
+        user_id=(
+            None if user_id is None else checked_sqlite_int(user_id, "user_id")
+        ),
+        target_id=(
+            None if target_id is None else checked_sqlite_int(target_id, "target_id")
+        ),
+        created_at_ms=checked_sqlite_int(
+            payload.get("created_at_ms", snowflake_ms(entry_id)),
+            "created_at_ms",
+        ),
+        reason=reason,
         payload_json=payload_json,
         first_received_at_ms=received_at_ms,
         last_seen_at_ms=received_at_ms,
@@ -441,7 +545,7 @@ class SQLiteStore:
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=5000")
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2, 3, SCHEMA_VERSION):
+        if version not in (0, 1, 2, 3, 4, SCHEMA_VERSION):
             connection.close()
             raise RuntimeError(f"Unsupported database schema version: {version}")
         if version in (0, 1):
@@ -485,6 +589,16 @@ class SQLiteStore:
         }:
             connection.close()
             raise RuntimeError("staging_entries schema mismatch")
+        dead_letter_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(audit_dead_letters)")
+        }
+        if dead_letter_columns != {
+            "guild_id", "entry_id", "source", "error_type", "error_text",
+            "first_seen_at_ms", "last_seen_at_ms", "attempts",
+        }:
+            connection.close()
+            raise RuntimeError("audit_dead_letters schema mismatch")
         connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         connection.commit()
         self._connection = connection
@@ -494,21 +608,47 @@ class SQLiteStore:
         rows: Iterable[AuditRow],
         *,
         checkpoint: Optional[tuple[int, int]] = None,
+        dead_letters: Iterable[DeadLetter] = (),
     ) -> None:
         materialised = list(rows)
-        if not materialised and checkpoint is None:
+        materialised_dead_letters = list(dead_letters)
+        if not materialised and not materialised_dead_letters and checkpoint is None:
             return
-        await self._run(self._upsert, materialised, checkpoint)
+        await self._run(
+            self._upsert,
+            materialised,
+            checkpoint,
+            materialised_dead_letters,
+        )
 
     def _upsert(
         self,
         rows: list[AuditRow],
         checkpoint: Optional[tuple[int, int]],
+        dead_letters: list[DeadLetter],
     ) -> None:
         assert self._connection is not None
         with self._connection:
             if rows:
                 self._connection.executemany(UPSERT_SQL, [row.values() for row in rows])
+                resolved = [
+                    (row.guild_id, row.entry_id)
+                    for row in rows
+                    if row.last_source in {"rest_backfill", "rest_refresh"}
+                ]
+                if resolved:
+                    self._connection.executemany(
+                        """
+                        DELETE FROM audit_dead_letters
+                        WHERE guild_id = ? AND entry_id = ?
+                        """,
+                        resolved,
+                    )
+            if dead_letters:
+                self._connection.executemany(
+                    DEAD_LETTER_UPSERT_SQL,
+                    [dead_letter.values() for dead_letter in dead_letters],
+                )
             if checkpoint is not None:
                 guild_id, entry_id = checkpoint
                 self._connection.execute(
@@ -584,9 +724,22 @@ class SQLiteStore:
                             int(received_at_ms),
                         )
                     )
-                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                except (
+                    KeyError,
+                    TypeError,
+                    ValueError,
+                    OverflowError,
+                    RecursionError,
+                    sqlite3.InterfaceError,
+                    json.JSONDecodeError,
+                ):
                     invalid_count += 1
-                    invalid_guild_id = int(guild_id)
+                    try:
+                        invalid_guild_id = checked_sqlite_int(
+                            guild_id, "staging.guild_id"
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        invalid_guild_id = 0
                     invalid_by_guild[invalid_guild_id] = (
                         invalid_by_guild.get(invalid_guild_id, 0) + 1
                     )
@@ -613,6 +766,17 @@ class SQLiteStore:
         assert self._connection is not None
         row = self._connection.execute(
             "SELECT COUNT(*) FROM staging_entries"
+        ).fetchone()
+        return int(row[0])
+
+    async def count_dead_letters(self, guild_id: int) -> int:
+        return int(await self._run(self._count_dead_letters, guild_id))
+
+    def _count_dead_letters(self, guild_id: int) -> int:
+        assert self._connection is not None
+        row = self._connection.execute(
+            "SELECT COUNT(*) FROM audit_dead_letters WHERE guild_id = ?",
+            (guild_id,),
         ).fetchone()
         return int(row[0])
 
@@ -766,6 +930,136 @@ class SQLiteStore:
             "checkpoint": None if state is None else int(state[0]),
             "checkpoint_updated_at_ms": None if state is None else int(state[1]),
         }
+
+    async def prune_before(
+        self,
+        cutoff_ms: int,
+        guild_ids: Iterable[int],
+        *,
+        batch_size: int = RETENTION_PRUNE_BATCH_SIZE,
+    ) -> tuple[int, int]:
+        cutoff_entry_id = max(0, (cutoff_ms - DISCORD_EPOCH_MS) << 22)
+        if cutoff_entry_id == 0:
+            return 0, 0
+        stored_guild_ids = await self._run(self._retention_guild_ids)
+        all_guild_ids = sorted({int(value) for value in guild_ids} | set(stored_guild_ids))
+        pruned_entries = 0
+        pruned_dead_letters = 0
+        for guild_id in all_guild_ids:
+            while True:
+                deleted = int(
+                    await self._run(
+                        self._prune_entries_batch,
+                        guild_id,
+                        cutoff_entry_id,
+                        cutoff_ms,
+                        batch_size,
+                    )
+                )
+                pruned_entries += deleted
+                if deleted < batch_size:
+                    break
+                await asyncio.sleep(0)
+            while True:
+                deleted = int(
+                    await self._run(
+                        self._prune_dead_letters_batch,
+                        guild_id,
+                        cutoff_entry_id,
+                        batch_size,
+                    )
+                )
+                pruned_dead_letters += deleted
+                if deleted < batch_size:
+                    break
+                await asyncio.sleep(0)
+        return pruned_entries, pruned_dead_letters
+
+    def _retention_guild_ids(self) -> list[int]:
+        assert self._connection is not None
+        rows = self._connection.execute(
+            """
+            SELECT guild_id FROM sync_state
+            UNION
+            SELECT guild_id FROM audit_roles
+            UNION
+            SELECT guild_id FROM audit_dead_letters
+            ORDER BY guild_id
+            """
+        ).fetchall()
+        guild_ids = {int(row[0]) for row in rows}
+        last_guild_id = -(2**63)
+        while True:
+            row = self._connection.execute(
+                """
+                SELECT guild_id FROM audit_entries
+                WHERE guild_id > ? ORDER BY guild_id LIMIT 1
+                """,
+                (last_guild_id,),
+            ).fetchone()
+            if row is None:
+                break
+            last_guild_id = int(row[0])
+            guild_ids.add(last_guild_id)
+        return sorted(guild_ids)
+
+    def _prune_entries_batch(
+        self,
+        guild_id: int,
+        cutoff_entry_id: int,
+        cutoff_ms: int,
+        batch_size: int,
+    ) -> int:
+        assert self._connection is not None
+        with self._connection:
+            cursor = self._connection.execute(
+                """
+                DELETE FROM audit_entries
+                WHERE guild_id = ? AND entry_id IN (
+                    SELECT entry_id FROM audit_entries
+                    WHERE guild_id = ? AND entry_id < ? AND created_at_ms < ?
+                    ORDER BY entry_id ASC LIMIT ?
+                )
+                """,
+                (guild_id, guild_id, cutoff_entry_id, cutoff_ms, batch_size),
+            )
+        return cursor.rowcount
+
+    def _prune_dead_letters_batch(
+        self,
+        guild_id: int,
+        cutoff_entry_id: int,
+        batch_size: int,
+    ) -> int:
+        assert self._connection is not None
+        with self._connection:
+            cursor = self._connection.execute(
+                """
+                DELETE FROM audit_dead_letters
+                WHERE guild_id = ? AND (entry_id, source) IN (
+                    SELECT entry_id, source FROM audit_dead_letters
+                    WHERE guild_id = ? AND entry_id < ?
+                    ORDER BY entry_id ASC, source ASC LIMIT ?
+                )
+                """,
+                (guild_id, guild_id, cutoff_entry_id, batch_size),
+            )
+        return cursor.rowcount
+
+    async def vacuum(self) -> None:
+        await self._run(self._vacuum)
+
+    def _vacuum(self) -> None:
+        assert self._connection is not None
+        self._connection.execute("VACUUM")
+
+    async def checkpoint_wal(self) -> tuple[int, int, int]:
+        return tuple(await self._run(self._checkpoint_wal))
+
+    def _checkpoint_wal(self) -> tuple[int, int, int]:
+        assert self._connection is not None
+        row = self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        return int(row[0]), int(row[1]), int(row[2])
 
     async def close(self) -> None:
         await self._run(self._close)
@@ -1274,8 +1568,11 @@ class AuditCommands(app_commands.Group):
         if interaction.guild_id is None:
             raise AuditInputError("This command is only available in a server.")
         await interaction.response.defer(ephemeral=True, thinking=True)
-        stats = await self.client.store.guild_stats(interaction.guild_id)
+        stats = await self.client.cached_guild_stats(interaction.guild_id)
         staging_count = await self.client.store.count_staging()
+        dead_letter_count = await self.client.store.count_dead_letters(
+            interaction.guild_id
+        )
         metrics = self.client.sync_metrics.get(interaction.guild_id, {})
         checkpoint = stats["checkpoint"]
         checkpoint_time = (
@@ -1302,7 +1599,16 @@ class AuditCommands(app_commands.Group):
             else f"<t:{last_sync_at_ms // 1000}:F>"
         )
         embed.add_field(name="Entries", value=f"{stats['count']:,}")
-        embed.add_field(name="Staging backlog", value=f"{staging_count:,}")
+        staging_value = f"{staging_count:,}"
+        if staging_count > STAGING_BACKLOG_WARN:
+            staging_value += "\nWARNING: 积压异常"
+            LOG.warning(
+                "Staging backlog exceeds threshold; backlog=%s threshold=%s guild=%s",
+                staging_count,
+                STAGING_BACKLOG_WARN,
+                interaction.guild_id,
+            )
+        embed.add_field(name="Staging backlog", value=staging_value)
         embed.add_field(
             name="Staging buffer",
             value=f"{self.client.staging_buffer.qsize():,}/{STAGING_BATCH_SIZE:,}",
@@ -1335,7 +1641,8 @@ class AuditCommands(app_commands.Group):
         embed.add_field(
             name="REST dead letters",
             value=(
-                f"{metrics.get('rest_dead_letters', 0):,}"
+                f"persistent={dead_letter_count:,}\n"
+                f"current run={metrics.get('dead_letters_this_run', 0):,}"
                 f" · last={metrics.get('last_dead_letter_entry_id', 'None')}"
             ),
         )
@@ -1363,11 +1670,15 @@ class AuditCommands(app_commands.Group):
             ),
             inline=False,
         )
+        persistent_dirty = (
+            interaction.guild_id in self.client.dirty_guilds
+            or dead_letter_count > 0
+        )
         embed.add_field(
             name="State",
             value=(
                 f"manual backfill={'active' if active else 'idle'}\n"
-                f"dirty={'yes' if interaction.guild_id in self.client.dirty_guilds else 'no'}\n"
+                f"dirty={'yes' if persistent_dirty else 'no'}\n"
                 f"REST lock={'busy' if self.client.rest_lock.locked() else 'idle'}\n"
                 f"sync interval={SYNC_INTERVAL_MINUTES}m"
             ),
@@ -1427,6 +1738,8 @@ class AuditArchiver(discord.Client):
         self.dirty_guilds: set[int] = set()
         self.dropped_events = 0
         self.sync_metrics: dict[int, dict[str, int]] = {}
+        self._stats_cache: dict[int, tuple[float, dict[str, Any]]] = {}
+        self._stats_cache_lock = asyncio.Lock()
         self.unhealthy_reason: Optional[str] = None
         self.accepting_events = True
         self.role_cache: dict[int, tuple[float, frozenset[int]]] = {}
@@ -1505,6 +1818,23 @@ class AuditArchiver(discord.Client):
         raise RuntimeError(
             "AUDIT_COMMAND_SYNC_MODE must be none, guild, or global"
         )
+
+    async def cached_guild_stats(self, guild_id: int) -> dict[str, Any]:
+        current = time.monotonic()
+        cached = self._stats_cache.get(guild_id)
+        if cached is not None and cached[0] > current:
+            return dict(cached[1])
+        async with self._stats_cache_lock:
+            current = time.monotonic()
+            cached = self._stats_cache.get(guild_id)
+            if cached is not None and cached[0] > current:
+                return dict(cached[1])
+            result = await self.store.guild_stats(guild_id)
+            self._stats_cache[guild_id] = (
+                time.monotonic() + STATS_CACHE_SECONDS,
+                dict(result),
+            )
+            return dict(result)
 
     async def authorized_role_ids(self, guild_id: int) -> frozenset[int]:
         cached = self.role_cache.get(guild_id)
@@ -1721,16 +2051,32 @@ class AuditArchiver(discord.Client):
         guild_id: int,
         entry_id: int,
         source: str,
-    ) -> None:
+        error: Exception,
+    ) -> DeadLetter:
         metrics = self.sync_metrics.setdefault(guild_id, {})
-        metrics["rest_dead_letters"] = metrics.get("rest_dead_letters", 0) + 1
+        metrics["dead_letters_this_run"] = (
+            metrics.get("dead_letters_this_run", 0) + 1
+        )
         metrics["last_dead_letter_entry_id"] = entry_id
         self.dirty_guilds.add(guild_id)
-        LOG.exception(
+        LOG.error(
             "Could not convert REST audit entry guild=%s entry=%s source=%s",
             guild_id,
             entry_id,
             source,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+        try:
+            error_text = str(error)[:1000]
+        except Exception:
+            error_text = "Could not stringify conversion error"
+        return DeadLetter(
+            guild_id=guild_id,
+            entry_id=entry_id,
+            source=source,
+            error_type=type(error).__name__,
+            error_text=error_text,
+            seen_at_ms=now_ms(),
         )
 
     def update_sync_metrics(
@@ -1763,13 +2109,21 @@ class AuditArchiver(discord.Client):
         # after=0 is strictly before every real audit-log snowflake, so the
         # oldest Discord-retained entry is included in a full replay.
         cursor = 0 if force_from_zero else self.replay_cursor(checkpoint)
+        if AUDIT_RETENTION_DAYS > 0:
+            cutoff_ms = now_ms() - AUDIT_RETENTION_DAYS * 86_400_000
+            retention_cursor = max(
+                0,
+                ((cutoff_ms - DISCORD_EPOCH_MS) << 22) - 1,
+            )
+            cursor = max(cursor, retention_cursor)
         highest = checkpoint
         committed_highest = checkpoint
         fetched_count = 0
         metrics = self.sync_metrics.setdefault(guild.id, {})
+        metrics["dead_letters_this_run"] = 0
         cumulative_base = metrics.get("cumulative_fetched", 0)
-        dead_letters_before = metrics.get("rest_dead_letters", 0)
         batch: list[AuditRow] = []
+        dead_letters: list[DeadLetter] = []
         last_refresh = time.monotonic()
 
         after = discord.Object(id=cursor)
@@ -1782,16 +2136,23 @@ class AuditArchiver(discord.Client):
             highest = max(highest, entry.id)
             try:
                 row = entry_to_row(entry, "rest_backfill")
-            except Exception:
-                self.record_rest_dead_letter(
-                    guild.id, entry.id, "rest_backfill"
+            except Exception as exc:
+                dead_letters.append(
+                    self.record_rest_dead_letter(
+                        guild.id, entry.id, "rest_backfill", exc
+                    )
                 )
-                continue
-            batch.append(row)
-            if len(batch) >= 100:
-                await self.store.upsert(batch, checkpoint=(guild.id, highest))
+            else:
+                batch.append(row)
+            if len(batch) + len(dead_letters) >= 100:
+                await self.store.upsert(
+                    batch,
+                    checkpoint=(guild.id, highest),
+                    dead_letters=dead_letters,
+                )
                 committed_highest = highest
                 batch.clear()
+                dead_letters.clear()
                 self.update_sync_metrics(
                     guild.id,
                     fetched_count=fetched_count,
@@ -1804,8 +2165,12 @@ class AuditArchiver(discord.Client):
                     await self.refresh_mutable_entries(guild)
                     last_refresh = time.monotonic()
 
-        if batch or highest > committed_highest:
-            await self.store.upsert(batch, checkpoint=(guild.id, highest))
+        if batch or dead_letters or highest > committed_highest:
+            await self.store.upsert(
+                batch,
+                checkpoint=(guild.id, highest),
+                dead_letters=dead_letters,
+            )
         self.update_sync_metrics(
             guild.id,
             fetched_count=fetched_count,
@@ -1821,7 +2186,7 @@ class AuditArchiver(discord.Client):
             highest,
             self.sync_metrics[guild.id]["last_sync_duration_ms"],
         )
-        if metrics.get("rest_dead_letters", 0) > dead_letters_before:
+        if await self.store.count_dead_letters(guild.id):
             self.dirty_guilds.add(guild.id)
         else:
             self.dirty_guilds.discard(guild.id)
@@ -1834,14 +2199,21 @@ class AuditArchiver(discord.Client):
         )
         for action in actions:
             rows: list[AuditRow] = []
+            dead_letters: list[DeadLetter] = []
             async for entry in guild.audit_logs(limit=100, action=action):
                 try:
                     rows.append(entry_to_row(entry, "rest_refresh"))
-                except Exception:
-                    self.record_rest_dead_letter(
-                        guild.id, entry.id, "rest_refresh"
+                except Exception as exc:
+                    dead_letters.append(
+                        self.record_rest_dead_letter(
+                            guild.id, entry.id, "rest_refresh", exc
+                        )
                     )
-            await self.store.upsert(rows)
+            await self.store.upsert(rows, dead_letters=dead_letters)
+        if await self.store.count_dead_letters(guild.id):
+            self.dirty_guilds.add(guild.id)
+        else:
+            self.dirty_guilds.discard(guild.id)
 
     @tasks.loop(minutes=SYNC_INTERVAL_MINUTES, reconnect=True)
     async def maintenance(self) -> None:
@@ -1866,6 +2238,50 @@ class AuditArchiver(discord.Client):
                 except Exception:
                     self.dirty_guilds.add(guild.id)
                     LOG.exception("Audit maintenance failed for guild %s", guild.id)
+
+        if AUDIT_RETENTION_DAYS > 0:
+            cutoff_ms = now_ms() - AUDIT_RETENTION_DAYS * 86_400_000
+            try:
+                pruned_entries, pruned_dead_letters = await self.store.prune_before(
+                    cutoff_ms,
+                    (guild.id for guild in self.guilds if self.tracked(guild.id)),
+                )
+                if pruned_entries or pruned_dead_letters:
+                    self._stats_cache.clear()
+                    LOG.info(
+                        "Audit retention pruned entries=%s dead_letters=%s cutoff_ms=%s",
+                        pruned_entries,
+                        pruned_dead_letters,
+                        cutoff_ms,
+                    )
+                    if AUDIT_VACUUM_AFTER_PRUNE:
+                        await self.store.vacuum()
+            except Exception:
+                LOG.exception("Audit retention pruning failed")
+
+        try:
+            staging_count = await self.store.count_staging()
+            if staging_count > STAGING_BACKLOG_WARN:
+                LOG.warning(
+                    "Staging backlog exceeds threshold; backlog=%s threshold=%s",
+                    staging_count,
+                    STAGING_BACKLOG_WARN,
+                )
+            busy, log_frames, checkpointed_frames = await self.store.checkpoint_wal()
+            if busy:
+                LOG.warning(
+                    "WAL checkpoint remained busy; log_frames=%s checkpointed=%s",
+                    log_frames,
+                    checkpointed_frames,
+                )
+            else:
+                LOG.info(
+                    "WAL checkpoint completed; log_frames=%s checkpointed=%s",
+                    log_frames,
+                    checkpointed_frames,
+                )
+        except Exception:
+            LOG.exception("SQLite maintenance failed")
 
     @maintenance.before_loop
     async def before_maintenance(self) -> None:
