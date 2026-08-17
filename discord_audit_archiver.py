@@ -1387,7 +1387,7 @@ def export_csv_values(row: dict[str, Any]) -> tuple[Any, ...]:
     created_at = dt.datetime.fromtimestamp(
         row["created_at_ms"] / 1000,
         dt.timezone.utc,
-    ).isoformat()
+    ).strftime("%Y-%m-%d %H:%M:%S")
     return (
         row["entry_id"],
         created_at,
