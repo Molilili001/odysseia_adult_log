@@ -1170,22 +1170,14 @@ def row_field(row: dict[str, Any]) -> tuple[str, str]:
     actor = "—" if row["user_id"] is None else f"`{row['user_id']}`"
     target = "—" if row["target_id"] is None else f"`{row['target_id']}`"
     reason = clean_text(row["reason"] or "—", 60)
-    details = {
-        key: payload[key]
-        for key in ("options", "changes")
-        if payload.get(key)
-    }
-    detail_text = clean_text(
-        json.dumps(details, ensure_ascii=False, separators=(",", ":"))
-        if details
-        else "—",
-        80,
-    )
     name = clean_text(f"{action} · {row['entry_id']}", 256)
     value = (
-        f"<t:{timestamp}:f> · 操作者 {actor} · 目标 {target}\n"
-        f"理由：{reason}\n详情：`{detail_text}`\n"
-        f"来源：`{row['last_source']}`"
+        f"**时间：** <t:{timestamp}:f>\n"
+        f"**操作者：** {actor}\n"
+        f"**目标：** {target}\n"
+        f"**理由：** {reason}\n"
+        f"**来源：** `{row['last_source']}`\n"
+        f"**详情：** *💡 完整数据请通过下方下拉列表选取查看*"
     )
     return name, value
 
@@ -1896,58 +1888,58 @@ class AuditCommands(app_commands.Group):
         embed.add_field(name="归档条目数", value=f"{stats['count']:,}")
         staging_value = f"{staging_count:,}"
         if staging_count > STAGING_BACKLOG_WARN:
-            staging_value += "\n⚠ 积压异常"
+            staging_value += "\n⚠ 处理队列积压异常"
             LOG.warning(
                 "Staging backlog exceeds threshold; backlog=%s threshold=%s guild=%s",
                 staging_count,
                 STAGING_BACKLOG_WARN,
                 interaction.guild_id,
             )
-        embed.add_field(name="中转积压", value=staging_value)
+        embed.add_field(name="处理队列积压", value=staging_value)
         embed.add_field(
-            name="中转缓冲",
+            name="事件缓冲池",
             value=f"{self.client.staging_buffer.qsize():,}/{STAGING_BATCH_SIZE:,}",
         )
         embed.add_field(
-            name="中转等待数", value=f"{self.client.staging_waiters:,}"
+            name="等待处理数", value=f"{self.client.staging_waiters:,}"
         )
         embed.add_field(
-            name="准入超时",
+            name="入队超时",
             value=(
-                f"进程={self.client.staging_admission_timeouts:,}"
-                f" · 服务器={metrics.get('staging_admission_timeouts', 0):,}"
+                f"全局={self.client.staging_admission_timeouts:,}"
+                f" · 本服={metrics.get('staging_admission_timeouts', 0):,}"
             ),
         )
         embed.add_field(
-            name="进程丢弃数", value=f"{self.client.dropped_events:,}"
+            name="丢弃事件数", value=f"{self.client.dropped_events:,}"
         )
         embed.add_field(
-            name="服务器中转失败",
+            name="服务器入库失败",
             value=f"{metrics.get('cumulative_dropped', 0):,}",
         )
         embed.add_field(
-            name="上次自愈抓取",
+            name="上次自动修复抓取量",
             value=f"{metrics.get('last_fetched_count', 0):,}",
         )
         embed.add_field(
-            name="累计抓取",
+            name="累计抓取数",
             value=f"{metrics.get('cumulative_fetched', 0):,}",
         )
         embed.add_field(
-            name="REST 死信",
+            name="失效 API 队列",
             value=(
-                f"持久={dead_letter_count:,}\n"
-                f"本轮={metrics.get('dead_letters_this_run', 0):,}"
-                f" · 最近={metrics.get('last_dead_letter_entry_id', '无')}"
+                f"累计={dead_letter_count:,}\n"
+                f"本次={metrics.get('dead_letters_this_run', 0):,}"
+                f" · 最近记录={metrics.get('last_dead_letter_entry_id', '无')}"
             ),
         )
         embed.add_field(
-            name="上次自愈耗时",
+            name="上次自动修复耗时",
             value=f"{metrics.get('last_sync_duration_ms', 0):,} 毫秒",
         )
-        embed.add_field(name="上次自愈", value=last_sync, inline=False)
-        embed.add_field(name="归档范围", value=f"{first_time} → {last_time}", inline=False)
-        embed.add_field(name="同步游标", value=checkpoint_time, inline=False)
+        embed.add_field(name="最近自动修复", value=last_sync, inline=False)
+        embed.add_field(name="记录归档范围", value=f"{first_time} → {last_time}", inline=False)
+        embed.add_field(name="当前同步进度", value=checkpoint_time, inline=False)
         writer_alive = bool(
             self.client.staging_writer_task
             and not self.client.staging_writer_task.done()
@@ -1957,11 +1949,11 @@ class AuditCommands(app_commands.Group):
         )
         health = clean_text(self.client.unhealthy_reason or "健康", 700)
         embed.add_field(
-            name="后台健康",
+            name="后台服务状态",
             value=(
-                f"写入={'运行中' if writer_alive else '已停止'}\n"
-                f"消费={'运行中' if worker_alive else '已停止'}\n"
-                f"状态={health}"
+                f"写入进程={'运行中' if writer_alive else '已停止'}\n"
+                f"消费进程={'运行中' if worker_alive else '已停止'}\n"
+                f"运行状态={health}"
             ),
             inline=False,
         )
@@ -1970,11 +1962,11 @@ class AuditCommands(app_commands.Group):
             or dead_letter_count > 0
         )
         embed.add_field(
-            name="状态",
+            name="运行状态",
             value=(
-                f"手动回填={'进行中' if active else '空闲'}\n"
-                f"脏标记={'是' if persistent_dirty else '否'}\n"
-                f"REST 锁={'占用' if self.client.rest_lock.locked() else '空闲'}\n"
+                f"手动同步历史={'进行中' if active else '空闲'}\n"
+                f"数据待刷新={'是' if persistent_dirty else '否'}\n"
+                f"API 频率锁={'占用' if self.client.rest_lock.locked() else '空闲'}\n"
                 f"同步间隔={SYNC_INTERVAL_MINUTES} 分钟"
             ),
             inline=False,
