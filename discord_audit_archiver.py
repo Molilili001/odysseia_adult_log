@@ -1079,6 +1079,75 @@ class AuditInputError(app_commands.AppCommandError):
 SNOWFLAKE_PATTERN = re.compile(r"^[0-9]{1,20}$")
 SQLITE_INT_MAX = 2**63 - 1
 ACTION_NAMES = {int(action.value): action.name for action in discord.AuditLogAction}
+ACTION_NAMES_ZH = {
+    "guild_update": "服务器更新",
+    "channel_create": "新建频道",
+    "channel_update": "频道更新",
+    "channel_delete": "删除频道",
+    "overwrite_create": "新建频道权限",
+    "overwrite_update": "修改频道权限",
+    "overwrite_delete": "删除频道权限",
+    "kick": "踢出成员",
+    "member_prune": "清理不活跃成员",
+    "ban": "封禁成员",
+    "unban": "解除封禁",
+    "member_update": "更新成员信息",
+    "member_role_update": "更新成员身份组",
+    "member_move": "移动语音成员",
+    "member_disconnect": "断开语音成员",
+    "bot_add": "添加机器人",
+    "role_create": "新建身份组",
+    "role_update": "修改身份组",
+    "role_delete": "删除身份组",
+    "invite_create": "新建邀请链接",
+    "invite_update": "修改邀请链接",
+    "invite_delete": "删除邀请链接",
+    "webhook_create": "新建网络回调",
+    "webhook_update": "修改网络回调",
+    "webhook_delete": "删除网络回调",
+    "emoji_create": "新建表情",
+    "emoji_update": "修改表情",
+    "emoji_delete": "删除表情",
+    "message_delete": "删除消息",
+    "message_bulk_delete": "批量删除消息",
+    "message_pin": "置顶消息",
+    "message_unpin": "取消置顶消息",
+    "integration_create": "新建集成",
+    "integration_update": "修改集成",
+    "integration_delete": "删除集成",
+    "stage_instance_create": "新建舞台实例",
+    "stage_instance_update": "修改舞台实例",
+    "stage_instance_delete": "删除舞台实例",
+    "sticker_create": "新建贴纸",
+    "sticker_update": "修改贴纸",
+    "sticker_delete": "删除贴纸",
+    "scheduled_event_create": "新建日程事件",
+    "scheduled_event_update": "修改日程事件",
+    "scheduled_event_delete": "删除日程事件",
+    "thread_create": "新建子区",
+    "thread_update": "子区更新",
+    "thread_delete": "删除子区",
+    "app_command_permission_update": "更新应用命令权限",
+    "soundboard_sound_create": "新建音效板音效",
+    "soundboard_sound_update": "修改音效板音效",
+    "soundboard_sound_delete": "删除音效板音效",
+    "automod_rule_create": "新建自动审核规则",
+    "automod_rule_update": "修改自动审核规则",
+    "automod_rule_delete": "删除自动审核规则",
+    "automod_block_message": "自动审核拦截消息",
+    "automod_flag_message": "自动审核标记消息到频道",
+    "automod_timeout_member": "自动审核禁用用户通信",
+    "automod_quarantine_user": "自动审核隔离用户",
+    "creator_monetization_request_created": "新建创作者变现申请",
+    "creator_monetization_terms_accepted": "接受创作者变现条款",
+    "onboarding_prompt_create": "新建新成员引导问题",
+    "onboarding_prompt_update": "修改新成员引导问题",
+    "onboarding_prompt_delete": "删除新成员引导问题",
+    "onboarding_create": "新建新成员引导",
+    "onboarding_update": "修改新成员引导",
+    "home_settings_create": "新建服务器主页设置",
+    "home_settings_update": "修改服务器主页设置",
+}
 
 
 def parse_time_bound(value: Optional[str], label: str) -> Optional[dt.datetime]:
@@ -1150,7 +1219,8 @@ def clean_text(value: Any, limit: int) -> str:
 
 def action_label(action_type: int, payload: dict[str, Any]) -> str:
     name = payload.get("action_name") or ACTION_NAMES.get(action_type)
-    return f"{name or '未知'} ({action_type})"
+    zh = ACTION_NAMES_ZH.get(name, name) if name else None
+    return f"{zh or '未知'} ({action_type})"
 
 
 def parse_row_payload(row: dict[str, Any]) -> tuple[dict[str, Any], Optional[str]]:
@@ -1321,7 +1391,7 @@ async def audit_action_autocomplete(
     needle = str(current).casefold().strip()
     choices = []
     for value, name in ACTION_NAMES.items():
-        label = f"操作类型 {value}：{name}"
+        label = f"操作类型 {value}：{ACTION_NAMES_ZH.get(name, name)}"
         if needle and needle not in label.casefold():
             continue
         choices.append(app_commands.Choice(name=label[:100], value=value))
