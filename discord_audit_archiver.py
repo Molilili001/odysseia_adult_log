@@ -44,6 +44,9 @@ def bounded_env_int(
 
 
 DB_PATH = Path(os.getenv("AUDIT_DB", "audit_logs.db"))
+DISK_MIN_FREE_BYTES = bounded_env_int(
+    "AUDIT_DISK_MIN_FREE_BYTES", 2 * 1024**3, minimum=0
+)
 STAGING_BATCH_SIZE = max(
     1, min(50, int(os.getenv("AUDIT_STAGING_BATCH_SIZE", "50")))
 )
@@ -84,6 +87,20 @@ COMMAND_GUILD_IDS = {
     for value in os.getenv("AUDIT_COMMAND_GUILD_IDS", "").split(",")
     if value.strip()
 } or TARGET_GUILDS
+
+
+def disk_free_bytes() -> int:
+    try:
+        filesystem = os.statvfs(DB_PATH)
+    except OSError:
+        LOG.warning(
+            "Could not determine free disk space for %s",
+            DB_PATH,
+            exc_info=True,
+        )
+        return 2**63 - 1
+    return int(filesystem.f_bavail) * int(filesystem.f_frsize)
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS audit_entries (
@@ -1978,6 +1995,11 @@ class AuditCommands(app_commands.Group):
             else f"<t:{last_sync_at_ms // 1000}:F>"
         )
         embed.add_field(name="归档条目数", value=f"{stats['count']:,}")
+        free_bytes = disk_free_bytes()
+        disk_value = f"{free_bytes / 1024**3:.2f} GB"
+        if free_bytes < DISK_MIN_FREE_BYTES:
+            disk_value += "\n⚠ 磁盘空间不足"
+        embed.add_field(name="磁盘剩余", value=disk_value)
         staging_value = f"{staging_count:,}"
         if staging_count > STAGING_BACKLOG_WARN:
             staging_value += "\n⚠ 处理队列积压异常"
@@ -2114,6 +2136,7 @@ class AuditArchiver(discord.Client):
         self.staging_writer_task: Optional[asyncio.Task[None]] = None
         self.worker_task: Optional[asyncio.Task[None]] = None
         self.rest_lock = asyncio.Lock()
+        self.disk_pressure = False
         self.dirty_guilds: set[int] = set()
         self.dropped_events = 0
         self.sync_metrics: dict[int, dict[str, int]] = {}
@@ -2284,7 +2307,8 @@ class AuditArchiver(discord.Client):
                 await self.store.reset_checkpoint(guild.id)
                 LOG.info("Reset audit backfill cursor for guild %s", guild.id)
             await self.backfill_guild(guild, force_from_zero=full)
-            await self.refresh_mutable_entries(guild)
+            if not self.disk_pressure:
+                await self.refresh_mutable_entries(guild)
 
     async def on_ready(self) -> None:
         LOG.info("Connected as %s; discord.py=%s", self.user, discord.__version__)
@@ -2481,6 +2505,15 @@ class AuditArchiver(discord.Client):
         self, guild: discord.Guild, *, force_from_zero: bool = False
     ) -> None:
         started_at = time.monotonic()
+        free_bytes = disk_free_bytes()
+        if free_bytes < DISK_MIN_FREE_BYTES:
+            self.disk_pressure = True
+            LOG.warning(
+                "Disk full during backfill; aborting this pass for guild %s",
+                guild.id,
+            )
+            return
+        self.disk_pressure = False
         old_checkpoint = (
             0 if force_from_zero else await self.store.checkpoint(guild.id)
         )
@@ -2539,6 +2572,15 @@ class AuditArchiver(discord.Client):
                     started_at=started_at,
                     cumulative_base=cumulative_base,
                 )
+            if fetched_count % 100 == 0:
+                free_bytes = disk_free_bytes()
+                if free_bytes < DISK_MIN_FREE_BYTES:
+                    self.disk_pressure = True
+                    LOG.warning(
+                        "Disk full during backfill; aborting this pass for guild %s",
+                        guild.id,
+                    )
+                    break
                 # A first 45-day crawl can take hours. Keep mutable entries fresh.
                 if time.monotonic() - last_refresh >= 600.0:
                     await self.refresh_mutable_entries(guild)
@@ -2597,26 +2639,37 @@ class AuditArchiver(discord.Client):
     @tasks.loop(minutes=SYNC_INTERVAL_MINUTES, reconnect=True)
     async def maintenance(self) -> None:
         async with self.rest_lock:
-            for guild in self.guilds:
-                if not self.tracked(guild.id):
-                    continue
-                me = guild.me
-                if me is None or not me.guild_permissions.view_audit_log:
-                    LOG.error("Missing View Audit Log permission in guild %s", guild.id)
-                    continue
-                try:
-                    # Reconcile missing entries first, then refresh mutable aggregate rows.
-                    await self.backfill_guild(guild)
-                    await self.refresh_mutable_entries(guild)
-                except discord.Forbidden:
-                    self.dirty_guilds.add(guild.id)
-                    LOG.exception("Audit log access denied for guild %s", guild.id)
-                except discord.HTTPException:
-                    self.dirty_guilds.add(guild.id)
-                    LOG.exception("Audit log REST failure for guild %s", guild.id)
-                except Exception:
-                    self.dirty_guilds.add(guild.id)
-                    LOG.exception("Audit maintenance failed for guild %s", guild.id)
+            free_bytes = disk_free_bytes()
+            self.disk_pressure = free_bytes < DISK_MIN_FREE_BYTES
+            if self.disk_pressure:
+                LOG.warning(
+                    "Disk pressure: free_bytes=%s < threshold=%s; skipping REST backfill",
+                    free_bytes,
+                    DISK_MIN_FREE_BYTES,
+                )
+            else:
+                for guild in self.guilds:
+                    if not self.tracked(guild.id):
+                        continue
+                    me = guild.me
+                    if me is None or not me.guild_permissions.view_audit_log:
+                        LOG.error("Missing View Audit Log permission in guild %s", guild.id)
+                        continue
+                    try:
+                        # Reconcile missing entries first, then refresh mutable aggregate rows.
+                        await self.backfill_guild(guild)
+                        if self.disk_pressure:
+                            break
+                        await self.refresh_mutable_entries(guild)
+                    except discord.Forbidden:
+                        self.dirty_guilds.add(guild.id)
+                        LOG.exception("Audit log access denied for guild %s", guild.id)
+                    except discord.HTTPException:
+                        self.dirty_guilds.add(guild.id)
+                        LOG.exception("Audit log REST failure for guild %s", guild.id)
+                    except Exception:
+                        self.dirty_guilds.add(guild.id)
+                        LOG.exception("Audit maintenance failed for guild %s", guild.id)
 
         if AUDIT_RETENTION_DAYS > 0:
             cutoff_ms = now_ms() - AUDIT_RETENTION_DAYS * 86_400_000
