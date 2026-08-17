@@ -1,0 +1,20 @@
+# 环境变量与密钥
+.env
+*.env
+.env.*
+
+# 本地数据库
+*.db
+*.db-wal
+*.db-shm
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 系统
+.DS_Store
+
