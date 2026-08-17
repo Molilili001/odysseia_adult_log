@@ -1094,7 +1094,7 @@ def parse_time_bound(value: Optional[str], label: str) -> Optional[dt.datetime]:
         return parsed.astimezone(dt.timezone.utc)
     except (ValueError, OverflowError) as exc:
         raise AuditInputError(
-            f"{label} must be ISO-8601, e.g. 2026-08-17T03:30:00Z"
+            f"参数 {label} 必须使用 ISO-8601 格式，例如 2026-08-17T03:30:00Z"
         ) from exc
 
 
@@ -1102,23 +1102,23 @@ def resolve_subject_id(
     user: Optional[discord.User], user_id: Optional[str]
 ) -> int:
     if user is not None and user_id:
-        raise AuditInputError("Choose user or user_id, not both.")
+        raise AuditInputError("user 与 user_id 不能同时填写。")
     if user is not None:
         return user.id
     if user_id and SNOWFLAKE_PATTERN.fullmatch(user_id.strip()):
         value = int(user_id)
         if 0 < value <= 9_223_372_036_854_775_807:
             return value
-    raise AuditInputError("Provide a user or a valid Discord user_id.")
+    raise AuditInputError("请提供用户或有效的 Discord 用户 ID。")
 
 
 def checked_time_snowflake(value: dt.datetime, label: str) -> int:
     try:
         snowflake = discord.utils.time_snowflake(value, high=False)
     except (ValueError, OverflowError) as exc:
-        raise AuditInputError(f"{label} is outside the supported time range.") from exc
+        raise AuditInputError(f"参数 {label} 超出支持的时间范围。") from exc
     if not 0 <= snowflake <= SQLITE_INT_MAX:
-        raise AuditInputError(f"{label} is outside the archived Snowflake range.")
+        raise AuditInputError(f"参数 {label} 超出归档 Snowflake 范围。")
     return snowflake
 
 
@@ -1128,7 +1128,7 @@ def make_time_bounds(
     after_time = parse_time_bound(after, "after")
     before_time = parse_time_bound(before, "before")
     if after_time and before_time and after_time >= before_time:
-        raise AuditInputError("after must be earlier than before.")
+        raise AuditInputError("after 必须早于 before。")
     lower = (
         None if after_time is None else checked_time_snowflake(after_time, "after")
     )
@@ -1138,7 +1138,7 @@ def make_time_bounds(
         else checked_time_snowflake(before_time, "before") - 1
     )
     if upper is not None and not 0 <= upper <= SQLITE_INT_MAX:
-        raise AuditInputError("before is outside the archived Snowflake range.")
+        raise AuditInputError("before 超出归档 Snowflake 范围。")
     return lower, upper
 
 
@@ -1150,14 +1150,21 @@ def clean_text(value: Any, limit: int) -> str:
 
 def action_label(action_type: int, payload: dict[str, Any]) -> str:
     name = payload.get("action_name") or ACTION_NAMES.get(action_type)
-    return f"{name or 'unknown'} ({action_type})"
+    return f"{name or '未知'} ({action_type})"
+
+
+def parse_row_payload(row: dict[str, Any]) -> tuple[dict[str, Any], Optional[str]]:
+    try:
+        payload = json.loads(row["payload_json"])
+    except (TypeError, ValueError, RecursionError) as exc:
+        return {}, f"payload_json 解析失败：{type(exc).__name__}"
+    if not isinstance(payload, dict):
+        return {}, "payload_json 顶层不是 JSON 对象"
+    return payload, None
 
 
 def row_field(row: dict[str, Any]) -> tuple[str, str]:
-    try:
-        payload = json.loads(row["payload_json"])
-    except (TypeError, json.JSONDecodeError):
-        payload = {}
+    payload, _ = parse_row_payload(row)
     action = action_label(row["action_type"], payload)
     timestamp = row["created_at_ms"] // 1000
     actor = "—" if row["user_id"] is None else f"`{row['user_id']}`"
@@ -1176,11 +1183,116 @@ def row_field(row: dict[str, Any]) -> tuple[str, str]:
     )
     name = clean_text(f"{action} · {row['entry_id']}", 256)
     value = (
-        f"<t:{timestamp}:f> · actor {actor} · target {target}\n"
-        f"Reason: {reason}\nDetails: `{detail_text}`\n"
-        f"Source: `{row['last_source']}`"
+        f"<t:{timestamp}:f> · 操作者 {actor} · 目标 {target}\n"
+        f"理由：{reason}\n详情：`{detail_text}`\n"
+        f"来源：`{row['last_source']}`"
     )
     return name, value
+
+
+DETAIL_JSON_CHUNK_SIZE = 700
+DETAIL_JSON_MAX_CHUNKS = 5
+
+
+def discord_text_units(text: str) -> int:
+    return sum(2 if ord(character) > 0xFFFF else 1 for character in text)
+
+
+def split_discord_text(text: str, maximum_units: int) -> list[str]:
+    chunks: list[str] = []
+    current: list[str] = []
+    current_units = 0
+    for character in text:
+        units = 2 if ord(character) > 0xFFFF else 1
+        if current and current_units + units > maximum_units:
+            chunks.append("".join(current))
+            current = []
+            current_units = 0
+        current.append(character)
+        current_units += units
+    if current:
+        chunks.append("".join(current))
+    return chunks
+
+
+def clipped_discord_text(text: str, maximum_units: int, marker: str) -> str:
+    if discord_text_units(text) <= maximum_units:
+        return text
+    marker_units = discord_text_units(marker)
+    available = max(0, maximum_units - marker_units)
+    prefix = split_discord_text(text, available)[0] if available else ""
+    return prefix + marker
+
+
+def select_option_text(value: Any, limit: int = 100) -> str:
+    text = " ".join(str(value).replace("\x00", "").split())
+    if not text:
+        text = "未知"
+    return clipped_discord_text(text, limit, "…")
+
+
+def formatted_detail_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        indent=2,
+        default=str,
+    ).replace("`", "ˋ")
+
+
+def clipped_detail_json(value: Any) -> tuple[str, bool]:
+    text = formatted_detail_json(value)
+    if discord_text_units(text) <= DETAIL_JSON_CHUNK_SIZE:
+        return text, False
+    marker = "\n…（此分组内容过长，已截断）"
+    return clipped_discord_text(text, DETAIL_JSON_CHUNK_SIZE, marker), True
+
+
+def detail_json_fields(
+    document: dict[str, Any],
+    payload: dict[str, Any],
+) -> tuple[list[tuple[str, str]], bool]:
+    text = formatted_detail_json(document)
+    maximum = DETAIL_JSON_CHUNK_SIZE * DETAIL_JSON_MAX_CHUNKS
+    if discord_text_units(text) <= maximum:
+        chunks = split_discord_text(text, DETAIL_JSON_CHUNK_SIZE) or ["{}"]
+        return [
+            (f"完整数据 {index}/{len(chunks)}", chunk)
+            for index, chunk in enumerate(chunks, start=1)
+        ], False
+
+    changes = payload.get("changes")
+    if isinstance(changes, dict):
+        before = changes.get("before")
+        after = changes.get("after")
+    else:
+        before = changes
+        after = None
+    remaining_payload = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"target", "changes", "options"}
+    }
+    groups = (
+        ("目标对象", payload.get("target")),
+        ("变更前", before),
+        ("变更后", after),
+        ("选项", payload.get("options")),
+        (
+            "其他载荷与归档信息",
+            {
+                "archive": document.get("archive"),
+                "payload": remaining_payload,
+            },
+        ),
+    )
+    fields: list[tuple[str, str]] = []
+    truncated = False
+    for name, value in groups:
+        content, group_truncated = clipped_detail_json(value)
+        truncated = truncated or group_truncated
+        fields.append((name, content))
+    return fields, truncated
 
 
 async def audit_authorized_check(interaction: discord.Interaction) -> bool:
@@ -1226,6 +1338,53 @@ async def audit_action_autocomplete(
     return choices
 
 
+class AuditEntrySelect(discord.ui.Select["AuditPageView"]):
+    def __init__(self) -> None:
+        super().__init__(
+            placeholder="选择当前页的审核日志查看完整详情",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label="当前页没有可选条目",
+                    value="0",
+                )
+            ],
+            row=0,
+            disabled=True,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        view = self.view
+        if view is None:
+            return
+        async with view.navigation_lock:
+            try:
+                entry_id = int(self.values[0])
+            except (IndexError, ValueError):
+                return
+            row = next(
+                (
+                    candidate
+                    for candidate in view.visible_rows
+                    if candidate["entry_id"] == entry_id
+                ),
+                None,
+            )
+            if row is None:
+                await interaction.followup.send(
+                    "该条目已不在当前页，请重新选择。",
+                    ephemeral=True,
+                )
+                return
+            view.detail_row = row
+            await interaction.edit_original_response(
+                embed=await view.build_embed(refresh_rows=False),
+                view=view,
+            )
+
+
 class AuditPageView(discord.ui.View):
     def __init__(
         self,
@@ -1243,48 +1402,178 @@ class AuditPageView(discord.ui.View):
         self.position = 0
         self.visible_rows: list[dict[str, Any]] = []
         self.has_more = False
+        self.detail_row: Optional[dict[str, Any]] = None
         self.navigation_lock = asyncio.Lock()
         self.message: Optional[discord.InteractionMessage] = None
+        self.entry_select = AuditEntrySelect()
+        self.add_item(self.entry_select)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.requester_id:
             await interaction.response.send_message(
-                "This pagination session belongs to another user.", ephemeral=True
+                "此分页会话属于其他用户。", ephemeral=True
             )
             return False
         if not await self.client.is_audit_authorized(interaction):
             await interaction.response.send_message(
-                "Your audit-query permission is no longer valid.", ephemeral=True
+                "你的审核日志查询权限已失效。", ephemeral=True
             )
             return False
         return True
 
-    async def build_embed(self) -> discord.Embed:
-        current = replace(self.query, cursor=self.cursors[self.position])
-        rows = await self.client.store.query_entries(current)
-        self.has_more = len(rows) > current.page_size
-        self.visible_rows = rows[: current.page_size]
+    def update_controls(self) -> None:
         self.previous_button.disabled = self.position == 0
         self.next_button.disabled = not self.has_more
+        self.return_button.disabled = self.detail_row is None
 
+        options: list[discord.SelectOption] = []
+        selected_entry_id = (
+            None if self.detail_row is None else self.detail_row["entry_id"]
+        )
+        for row in self.visible_rows:
+            payload, _ = parse_row_payload(row)
+            action = action_label(row["action_type"], payload)
+            timestamp = row["created_at_ms"] // 1000
+            actor = "无" if row["user_id"] is None else str(row["user_id"])
+            target = "无" if row["target_id"] is None else str(row["target_id"])
+            options.append(
+                discord.SelectOption(
+                    label=select_option_text(
+                        f"{action} · #{row['entry_id']}"
+                    ),
+                    value=str(row["entry_id"]),
+                    description=select_option_text(
+                        f"{dt.datetime.fromtimestamp(timestamp, dt.timezone.utc):%Y-%m-%d %H:%M:%S} UTC · 操作者 {actor} · 目标 {target}"
+                    ),
+                    default=row["entry_id"] == selected_entry_id,
+                )
+            )
+
+        self.entry_select.options = options or [
+            discord.SelectOption(label="当前页没有可选条目", value="0")
+        ]
+        self.entry_select.disabled = not options
+        self.entry_select.placeholder = (
+            "已选择当前审核日志"
+            if self.detail_row is not None
+            else "选择当前页的审核日志查看完整详情"
+        )
+
+    async def build_embed(self, *, refresh_rows: bool = True) -> discord.Embed:
+        if refresh_rows:
+            current = replace(self.query, cursor=self.cursors[self.position])
+            rows = await self.client.store.query_entries(current)
+            self.has_more = len(rows) > current.page_size
+            self.visible_rows = rows[: current.page_size]
+            if self.detail_row is not None and not any(
+                row["entry_id"] == self.detail_row["entry_id"]
+                for row in self.visible_rows
+            ):
+                self.detail_row = None
+
+        self.update_controls()
+        if self.detail_row is not None:
+            return self.build_detail_embed(self.detail_row)
+        return self.build_list_embed()
+
+    def build_list_embed(self) -> discord.Embed:
         embed = discord.Embed(
             title=self.title,
             colour=discord.Colour.blurple(),
             timestamp=dt.datetime.now(dt.timezone.utc),
         )
         if not self.visible_rows:
-            embed.description = "No matching archived audit entries."
+            embed.description = "没有匹配的已归档审核日志。"
         else:
             for row in self.visible_rows:
                 name, value = row_field(row)
                 embed.add_field(name=name, value=value, inline=False)
         cursor = self.cursors[self.position]
         embed.set_footer(
-            text=f"Page {self.position + 1} · keyset cursor {cursor or 'latest'}"
+            text=f"第 {self.position + 1} 页 · 游标 {cursor or '最新'}"
         )
         return embed
 
-    @discord.ui.button(label="上一页", style=discord.ButtonStyle.secondary)
+    def build_detail_embed(self, row: dict[str, Any]) -> discord.Embed:
+        payload, payload_error = parse_row_payload(row)
+        action = action_label(row["action_type"], payload)
+        timestamp = row["created_at_ms"] // 1000
+        actor = "无" if row["user_id"] is None else str(row["user_id"])
+        target_id = "无" if row["target_id"] is None else str(row["target_id"])
+        reason = row["reason"] if row["reason"] is not None else payload.get("reason")
+        reason_text = clean_text(reason if reason is not None else "无", 600)
+        description = (
+            f"**操作类型：** {clean_text(action, 100)}\n"
+            f"**条目 ID：** `{row['entry_id']}`\n"
+            f"**时间：** <t:{timestamp}:F>\n"
+            f"**操作者 ID：** `{actor}`\n"
+            f"**目标 ID：** `{target_id}`\n"
+            f"**理由：** {reason_text}\n"
+            f"**来源：** `{clean_text(row['last_source'], 80)}`"
+        )
+        if payload_error is not None:
+            description += f"\n**载荷状态：** {payload_error}"
+
+        complete_document = {
+            "archive": {
+                "action_name": (
+                    payload.get("action_name")
+                    or ACTION_NAMES.get(row["action_type"])
+                ),
+                "action_type": row["action_type"],
+                "entry_id": row["entry_id"],
+                "created_at_ms": row["created_at_ms"],
+                "user_id": row["user_id"],
+                "target_id": row["target_id"],
+                "reason": reason,
+                "source": row["last_source"],
+            },
+            "payload": payload,
+        }
+        detail_fields, truncated = detail_json_fields(
+            complete_document,
+            payload,
+        )
+        embed = discord.Embed(
+            title=f"审核日志详情 · {row['entry_id']}",
+            description=description,
+            colour=discord.Colour.gold(),
+            timestamp=dt.datetime.now(dt.timezone.utc),
+        )
+        for name, content in detail_fields:
+            embed.add_field(
+                name=name,
+                value=f"```json\n{content}\n```",
+                inline=False,
+            )
+        footer = f"第 {self.position + 1} 页 · 详情模式"
+        if truncated:
+            footer += " · 内容已截断"
+        embed.set_footer(text=footer)
+        return embed
+
+    @discord.ui.button(
+        label="返回列表",
+        style=discord.ButtonStyle.secondary,
+        row=1,
+        disabled=True,
+    )
+    async def return_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await interaction.response.defer()
+        async with self.navigation_lock:
+            self.detail_row = None
+            await interaction.edit_original_response(
+                embed=await self.build_embed(refresh_rows=False),
+                view=self,
+            )
+
+    @discord.ui.button(
+        label="上一页",
+        style=discord.ButtonStyle.secondary,
+        row=1,
+    )
     async def previous_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
@@ -1292,11 +1581,16 @@ class AuditPageView(discord.ui.View):
         async with self.navigation_lock:
             if self.position > 0:
                 self.position -= 1
+            self.detail_row = None
             await interaction.edit_original_response(
                 embed=await self.build_embed(), view=self
             )
 
-    @discord.ui.button(label="下一页", style=discord.ButtonStyle.primary)
+    @discord.ui.button(
+        label="下一页",
+        style=discord.ButtonStyle.primary,
+        row=1,
+    )
     async def next_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
@@ -1310,13 +1604,14 @@ class AuditPageView(discord.ui.View):
             else:
                 self.cursors.append(next_cursor)
             self.position += 1
+            self.detail_row = None
             await interaction.edit_original_response(
                 embed=await self.build_embed(), view=self
             )
 
     async def on_timeout(self) -> None:
         for item in self.children:
-            if isinstance(item, discord.ui.Button):
+            if isinstance(item, (discord.ui.Button, discord.ui.Select)):
                 item.disabled = True
         if self.message is not None:
             with contextlib.suppress(discord.HTTPException):
@@ -1334,7 +1629,7 @@ class AuditPageView(discord.ui.View):
             item,
             exc_info=(type(error), error, error.__traceback__),
         )
-        message = "Audit pagination failed. Check the bot logs."
+        message = "审核日志分页失败，请联系管理员查看机器人日志。"
         with contextlib.suppress(discord.HTTPException):
             if interaction.response.is_done():
                 await interaction.followup.send(message, ephemeral=True)
@@ -1364,11 +1659,11 @@ class AuditCommands(app_commands.Group):
         page_size: int,
     ) -> None:
         if interaction.guild_id is None:
-            raise AuditInputError("This command is only available in a server.")
+            raise AuditInputError("本命令仅限服务器内使用。")
         if not 5 <= page_size <= 15:
-            raise AuditInputError("page_size must be between 5 and 15.")
+            raise AuditInputError("page_size 必须在 5 到 15 之间。")
         if action_type is not None and action_type < 0:
-            raise AuditInputError("action_type must be a non-negative integer.")
+            raise AuditInputError("action_type 必须是非负整数。")
         subject_id = resolve_subject_id(user, user_id)
         lower, upper = make_time_bounds(after, before)
         query = AuditQuery(
@@ -1380,8 +1675,8 @@ class AuditCommands(app_commands.Group):
             upper_entry_id=upper,
             page_size=page_size,
         )
-        label = "Actor" if filter_column == "user_id" else "Target"
-        title = f"Audit query · {label} {subject_id}"
+        label = "操作者" if filter_column == "user_id" else "目标"
+        title = f"审核日志查询 · {label} {subject_id}"
         view = AuditPageView(self.client, interaction.user.id, query, title)
         await interaction.response.defer(ephemeral=True, thinking=True)
         await interaction.edit_original_response(embed=await view.build_embed(), view=view)
@@ -1458,13 +1753,13 @@ class AuditCommands(app_commands.Group):
         self, interaction: discord.Interaction, role: discord.Role
     ) -> None:
         if interaction.guild_id is None or role.is_default():
-            raise AuditInputError("The everyone role cannot be authorized.")
+            raise AuditInputError("everyone 身份组不能授权。")
         await interaction.response.defer(ephemeral=True, thinking=True)
         added = await self.client.store.add_role(interaction.guild_id, role.id)
         self.client.role_cache.pop(interaction.guild_id, None)
-        message = "Authorized" if added else "Role was already authorized"
+        message = "已授权" if added else "该身份组此前已授权"
         await interaction.edit_original_response(
-            content=f"{message}: {role.mention} (`{role.id}`).",
+            content=f"{message}：{role.mention} (`{role.id}`)。",
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
@@ -1481,27 +1776,27 @@ class AuditCommands(app_commands.Group):
         role_id: Optional[str] = None,
     ) -> None:
         if interaction.guild_id is None:
-            raise AuditInputError("This command is only available in a server.")
+            raise AuditInputError("本命令仅限服务器内使用。")
         if role is not None and role_id:
-            raise AuditInputError("Choose role or role_id, not both.")
+            raise AuditInputError("role 与 role_id 不能同时填写。")
         if role is not None:
             selected_id = role.id
             label = role.mention
         elif role_id and SNOWFLAKE_PATTERN.fullmatch(role_id.strip()):
             selected_id = int(role_id)
             if not 0 < selected_id <= 9_223_372_036_854_775_807:
-                raise AuditInputError("role_id is outside SQLite's integer range.")
-            label = "role ID"
+                raise AuditInputError("role_id 超出 SQLite 整数范围。")
+            label = "身份组 ID"
         else:
-            raise AuditInputError("Provide a role or a valid role_id.")
+            raise AuditInputError("请提供身份组或有效的身份组 ID。")
         await interaction.response.defer(ephemeral=True, thinking=True)
         removed = await self.client.store.remove_role(
             interaction.guild_id, selected_id
         )
         self.client.role_cache.pop(interaction.guild_id, None)
         await interaction.edit_original_response(
-            content=("Removed" if removed else "Role was not authorized")
-            + f": {label} (`{selected_id}`).",
+            content=("已移除" if removed else "该身份组本就不在授权列表")
+            + f"：{label} (`{selected_id}`)。",
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
@@ -1509,21 +1804,21 @@ class AuditCommands(app_commands.Group):
     @guild_owner_only()
     async def role_list(self, interaction: discord.Interaction) -> None:
         if interaction.guild_id is None or interaction.guild is None:
-            raise AuditInputError("This command is only available in a server.")
+            raise AuditInputError("本命令仅限服务器内使用。")
         await interaction.response.defer(ephemeral=True, thinking=True)
         role_ids = await self.client.store.list_roles(interaction.guild_id)
         lines = []
         for role_id in role_ids:
             role = interaction.guild.get_role(role_id)
             lines.append(
-                f"{role.mention if role else 'deleted role'} (`{role_id}`)"
+                f"{role.mention if role else '已删除的身份组'} (`{role_id}`)"
             )
         visible = lines[:35]
         if len(lines) > len(visible):
-            visible.append(f"… and {len(lines) - len(visible)} more")
+            visible.append(f"… 另有 {len(lines) - len(visible)} 个")
         await interaction.edit_original_response(
-            content="Authorized roles:\n"
-            + ("\n".join(visible) if visible else "None"),
+            content="已授权身份组：\n"
+            + ("\n".join(visible) if visible else "（无）"),
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
@@ -1534,15 +1829,15 @@ class AuditCommands(app_commands.Group):
         self, interaction: discord.Interaction, confirm: bool
     ) -> None:
         if interaction.guild_id is None:
-            raise AuditInputError("This command is only available in a server.")
+            raise AuditInputError("本命令仅限服务器内使用。")
         await interaction.response.defer(ephemeral=True, thinking=True)
         if not confirm:
-            await interaction.edit_original_response(content="No roles were changed.")
+            await interaction.edit_original_response(content="未更改任何身份组。")
             return
         count = await self.client.store.clear_roles(interaction.guild_id)
         self.client.role_cache.pop(interaction.guild_id, None)
         await interaction.edit_original_response(
-            content=f"Cleared {count} authorized role entries."
+            content=f"已清除 {count} 条身份组授权记录。"
         )
 
     @app_commands.command(name="backfill", description="启动 REST 审核日志历史回填任务")
@@ -1552,13 +1847,13 @@ class AuditCommands(app_commands.Group):
         self, interaction: discord.Interaction, full: bool = False
     ) -> None:
         if interaction.guild is None:
-            raise AuditInputError("This command is only available in a server.")
+            raise AuditInputError("本命令仅限服务器内使用。")
         me = interaction.guild.me
         if me is None or not me.guild_permissions.view_audit_log:
-            raise AuditInputError("The bot lacks View Audit Log in this server.")
+            raise AuditInputError("机器人在本服务器缺少“查看审核日志”权限。")
         started, state = self.client.start_manual_backfill(interaction.guild, full)
         await interaction.response.send_message(
-            ("Started" if started else "Not started") + f": {state}.",
+            ("已启动" if started else "未启动") + f"：{state}。",
             ephemeral=True,
         )
 
@@ -1566,7 +1861,7 @@ class AuditCommands(app_commands.Group):
     @audit_authorized()
     async def stats(self, interaction: discord.Interaction) -> None:
         if interaction.guild_id is None:
-            raise AuditInputError("This command is only available in a server.")
+            raise AuditInputError("本命令仅限服务器内使用。")
         await interaction.response.defer(ephemeral=True, thinking=True)
         stats = await self.client.cached_guild_stats(interaction.guild_id)
         staging_count = await self.client.store.count_staging()
@@ -1576,83 +1871,83 @@ class AuditCommands(app_commands.Group):
         metrics = self.client.sync_metrics.get(interaction.guild_id, {})
         checkpoint = stats["checkpoint"]
         checkpoint_time = (
-            "None"
+            "无"
             if checkpoint is None
             else f"<t:{snowflake_ms(checkpoint) // 1000}:F> (`{checkpoint}`)"
         )
         active = interaction.guild_id in self.client.backfill_tasks
-        embed = discord.Embed(title="Audit archive statistics", colour=discord.Colour.green())
+        embed = discord.Embed(title="审核日志归档统计", colour=discord.Colour.green())
         first_time = (
-            "None"
+            "无"
             if stats["min_created_at_ms"] is None
             else f"<t:{stats['min_created_at_ms'] // 1000}:f>"
         )
         last_time = (
-            "None"
+            "无"
             if stats["max_created_at_ms"] is None
             else f"<t:{stats['max_created_at_ms'] // 1000}:f>"
         )
         last_sync_at_ms = metrics.get("last_sync_at_ms")
         last_sync = (
-            "None"
+            "无"
             if last_sync_at_ms is None
             else f"<t:{last_sync_at_ms // 1000}:F>"
         )
-        embed.add_field(name="Entries", value=f"{stats['count']:,}")
+        embed.add_field(name="归档条目数", value=f"{stats['count']:,}")
         staging_value = f"{staging_count:,}"
         if staging_count > STAGING_BACKLOG_WARN:
-            staging_value += "\nWARNING: 积压异常"
+            staging_value += "\n⚠ 积压异常"
             LOG.warning(
                 "Staging backlog exceeds threshold; backlog=%s threshold=%s guild=%s",
                 staging_count,
                 STAGING_BACKLOG_WARN,
                 interaction.guild_id,
             )
-        embed.add_field(name="Staging backlog", value=staging_value)
+        embed.add_field(name="中转积压", value=staging_value)
         embed.add_field(
-            name="Staging buffer",
+            name="中转缓冲",
             value=f"{self.client.staging_buffer.qsize():,}/{STAGING_BATCH_SIZE:,}",
         )
         embed.add_field(
-            name="Staging waiters", value=f"{self.client.staging_waiters:,}"
+            name="中转等待数", value=f"{self.client.staging_waiters:,}"
         )
         embed.add_field(
-            name="Admission timeouts",
+            name="准入超时",
             value=(
-                f"process={self.client.staging_admission_timeouts:,}"
-                f" · guild={metrics.get('staging_admission_timeouts', 0):,}"
+                f"进程={self.client.staging_admission_timeouts:,}"
+                f" · 服务器={metrics.get('staging_admission_timeouts', 0):,}"
             ),
         )
         embed.add_field(
-            name="Process drops", value=f"{self.client.dropped_events:,}"
+            name="进程丢弃数", value=f"{self.client.dropped_events:,}"
         )
         embed.add_field(
-            name="Guild staging failures",
+            name="服务器中转失败",
             value=f"{metrics.get('cumulative_dropped', 0):,}",
         )
         embed.add_field(
-            name="Last self-heal fetched",
+            name="上次自愈抓取",
             value=f"{metrics.get('last_fetched_count', 0):,}",
         )
         embed.add_field(
-            name="Cumulative fetched",
+            name="累计抓取",
             value=f"{metrics.get('cumulative_fetched', 0):,}",
         )
         embed.add_field(
-            name="REST dead letters",
+            name="REST 死信",
             value=(
-                f"persistent={dead_letter_count:,}\n"
-                f"current run={metrics.get('dead_letters_this_run', 0):,}"
-                f" · last={metrics.get('last_dead_letter_entry_id', 'None')}"
+                f"持久={dead_letter_count:,}\n"
+                f"本轮={metrics.get('dead_letters_this_run', 0):,}"
+                f" · 最近={metrics.get('last_dead_letter_entry_id', '无')}"
             ),
         )
         embed.add_field(
-            name="Last self-heal duration",
-            value=f"{metrics.get('last_sync_duration_ms', 0):,} ms",
+            name="上次自愈耗时",
+            value=f"{metrics.get('last_sync_duration_ms', 0):,} 毫秒",
         )
-        embed.add_field(name="Last self-heal", value=last_sync, inline=False)
-        embed.add_field(name="Archived range", value=f"{first_time} → {last_time}", inline=False)
-        embed.add_field(name="Sync cursor", value=checkpoint_time, inline=False)
+        embed.add_field(name="上次自愈", value=last_sync, inline=False)
+        embed.add_field(name="归档范围", value=f"{first_time} → {last_time}", inline=False)
+        embed.add_field(name="同步游标", value=checkpoint_time, inline=False)
         writer_alive = bool(
             self.client.staging_writer_task
             and not self.client.staging_writer_task.done()
@@ -1660,13 +1955,13 @@ class AuditCommands(app_commands.Group):
         worker_alive = bool(
             self.client.worker_task and not self.client.worker_task.done()
         )
-        health = clean_text(self.client.unhealthy_reason or "healthy", 700)
+        health = clean_text(self.client.unhealthy_reason or "健康", 700)
         embed.add_field(
-            name="Background health",
+            name="后台健康",
             value=(
-                f"writer={'running' if writer_alive else 'stopped'}\n"
-                f"consumer={'running' if worker_alive else 'stopped'}\n"
-                f"status={health}"
+                f"写入={'运行中' if writer_alive else '已停止'}\n"
+                f"消费={'运行中' if worker_alive else '已停止'}\n"
+                f"状态={health}"
             ),
             inline=False,
         )
@@ -1675,12 +1970,12 @@ class AuditCommands(app_commands.Group):
             or dead_letter_count > 0
         )
         embed.add_field(
-            name="State",
+            name="状态",
             value=(
-                f"manual backfill={'active' if active else 'idle'}\n"
-                f"dirty={'yes' if persistent_dirty else 'no'}\n"
-                f"REST lock={'busy' if self.client.rest_lock.locked() else 'idle'}\n"
-                f"sync interval={SYNC_INTERVAL_MINUTES}m"
+                f"手动回填={'进行中' if active else '空闲'}\n"
+                f"脏标记={'是' if persistent_dirty else '否'}\n"
+                f"REST 锁={'占用' if self.client.rest_lock.locked() else '空闲'}\n"
+                f"同步间隔={SYNC_INTERVAL_MINUTES} 分钟"
             ),
             inline=False,
         )
@@ -1691,7 +1986,7 @@ class AuditCommands(app_commands.Group):
     ) -> None:
         original = getattr(error, "original", error)
         if isinstance(error, app_commands.CheckFailure):
-            message = "You do not have permission to use this audit command."
+            message = "你没有权限使用此审核日志命令。"
         elif isinstance(original, AuditInputError):
             message = str(original)
         else:
@@ -1700,7 +1995,7 @@ class AuditCommands(app_commands.Group):
                 getattr(interaction.command, "qualified_name", "unknown"),
                 exc_info=(type(original), original, original.__traceback__),
             )
-            message = "The audit command failed. Check the bot logs."
+            message = "审核日志命令执行失败，请联系管理员查看机器人日志。"
         if interaction.response.is_done():
             if (
                 interaction.response.type
@@ -1864,7 +2159,7 @@ class AuditArchiver(discord.Client):
     ) -> tuple[bool, str]:
         existing = self.backfill_tasks.get(guild.id)
         if existing is not None and not existing.done():
-            return False, "a manual backfill is already running"
+            return False, "已有手动回填任务正在运行"
         task = asyncio.create_task(
             self.manual_backfill(guild, full),
             name=f"manual-audit-backfill:{guild.id}",
@@ -1875,7 +2170,7 @@ class AuditArchiver(discord.Client):
                 guild_id, finished
             )
         )
-        return True, "full retained-history replay" if full else "incremental replay"
+        return True, "完整重放保留期内历史" if full else "增量重放"
 
     def finish_manual_backfill(
         self, guild_id: int, task: asyncio.Task[None]
