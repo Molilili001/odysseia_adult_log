@@ -1282,6 +1282,9 @@ ACTION_NAMES_ZH = {
 }
 
 
+BEIJING_TZ = dt.timezone(dt.timedelta(hours=8))
+
+
 def parse_time_bound(value: Optional[str], label: str) -> Optional[dt.datetime]:
     if value is None or not value.strip():
         return None
@@ -1291,11 +1294,11 @@ def parse_time_bound(value: Optional[str], label: str) -> Optional[dt.datetime]:
     try:
         parsed = dt.datetime.fromisoformat(text)
         if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+            parsed = parsed.replace(tzinfo=BEIJING_TZ)
         return parsed.astimezone(dt.timezone.utc)
     except (ValueError, OverflowError) as exc:
         raise AuditInputError(
-            f"参数 {label} 必须使用 ISO-8601 格式，例如 2026-08-17T03:30:00Z"
+            f"参数 {label} 请直接写日期时间，例如 2026-08-17 15:30（默认北京时间）"
         ) from exc
 
 
@@ -2022,8 +2025,8 @@ class AuditCommands(app_commands.Group):
         user="选择当前服务器中的用户",
         user_id="手动填写用户 ID，适用于已离开服务器的用户",
         action_type="按操作类型筛选，可输入中文关键词或数字搜索，例如：封禁、身份组、子区、51",
-        after="起始时间（含），ISO-8601 格式",
-        before="结束时间（不含），ISO-8601 格式",
+        after="起始时间（含），例如 2026-08-17 15:30，默认北京时间",
+        before="结束时间（不含），例如 2026-08-17 15:30，默认北京时间",
         page_size="每页结果数，范围 5–15",
     )
     @app_commands.autocomplete(action_type=audit_action_autocomplete)
@@ -2054,8 +2057,8 @@ class AuditCommands(app_commands.Group):
         user="选择当前服务器中的目标用户",
         user_id="手动填写目标用户 ID，适用于已离开服务器的用户",
         action_type="按操作类型筛选，可输入中文关键词或数字搜索，例如：封禁、身份组、子区、51",
-        after="起始时间（含），ISO-8601 格式",
-        before="结束时间（不含），ISO-8601 格式",
+        after="起始时间（含），例如 2026-08-17 15:30，默认北京时间",
+        before="结束时间（不含），例如 2026-08-17 15:30，默认北京时间",
         page_size="每页结果数，范围 5–15",
     )
     @app_commands.autocomplete(action_type=audit_action_autocomplete)
@@ -2083,8 +2086,8 @@ class AuditCommands(app_commands.Group):
 
     @app_commands.command(name="export", description="导出归档审核日志为 CSV 文件")
     @app_commands.describe(
-        after="起始时间（含），ISO-8601 格式",
-        before="结束时间（不含），ISO-8601 格式",
+        after="起始时间（含），例如 2026-08-17 15:30，默认北京时间",
+        before="结束时间（不含），例如 2026-08-17 15:30，默认北京时间",
         action_type="按操作类型筛选，可输入中文关键词或数字搜索",
         user_id="按操作者 ID 筛选",
         target_id="按目标 ID 筛选",
