@@ -1389,12 +1389,34 @@ async def audit_action_autocomplete(
     interaction: discord.Interaction, current: int | str
 ) -> list[app_commands.Choice[int]]:
     needle = str(current).casefold().strip()
-    choices = []
+    choices: list[app_commands.Choice[int]] = []
+
+    if needle.isdigit():
+        target = int(needle)
+        exact = [value for value in ACTION_NAMES if value == target]
+        for value in exact:
+            name = ACTION_NAMES[value]
+            zh = ACTION_NAMES_ZH.get(name, name)
+            choices.append(
+                app_commands.Choice(
+                    name=f"操作类型 {value}：{zh}"[:100],
+                    value=value,
+                )
+            )
+        if choices:
+            return choices
+
     for value, name in ACTION_NAMES.items():
-        label = f"操作类型 {value}：{ACTION_NAMES_ZH.get(name, name)}"
-        if needle and needle not in label.casefold():
+        zh = ACTION_NAMES_ZH.get(name, name)
+        haystack = f"{value} {zh} {name}".casefold()
+        if needle and needle not in haystack:
             continue
-        choices.append(app_commands.Choice(name=label[:100], value=value))
+        choices.append(
+            app_commands.Choice(
+                name=f"操作类型 {value}：{zh}"[:100],
+                value=value,
+            )
+        )
         if len(choices) >= 25:
             break
     return choices
@@ -1748,7 +1770,7 @@ class AuditCommands(app_commands.Group):
     @app_commands.describe(
         user="选择当前服务器中的用户",
         user_id="手动填写用户 ID，适用于已离开服务器的用户",
-        action_type="可选的 Discord 审核日志操作类型",
+        action_type="按操作类型筛选，可输入中文关键词或数字搜索，例如：封禁、身份组、子区、51",
         after="起始时间（含），ISO-8601 格式",
         before="结束时间（不含），ISO-8601 格式",
         page_size="每页结果数，范围 5–15",
@@ -1780,7 +1802,7 @@ class AuditCommands(app_commands.Group):
     @app_commands.describe(
         user="选择当前服务器中的目标用户",
         user_id="手动填写目标用户 ID，适用于已离开服务器的用户",
-        action_type="可选的 Discord 审核日志操作类型",
+        action_type="按操作类型筛选，可输入中文关键词或数字搜索，例如：封禁、身份组、子区、51",
         after="起始时间（含），ISO-8601 格式",
         before="结束时间（不含），ISO-8601 格式",
         page_size="每页结果数，范围 5–15",
