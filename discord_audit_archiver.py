@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import csv
 import datetime as dt
 import functools
+import io
 import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
+import tempfile
 import time
+import zipfile
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -56,6 +61,21 @@ STAGING_WRITE_RETRIES = 5
 STAGING_CONSUME_SIZE = 500
 STATS_CACHE_SECONDS = 60.0
 RETENTION_PRUNE_BATCH_SIZE = 1000
+EXPORT_BATCH_SIZE = 5000
+EXPORT_PART_MAX_ROWS = 100_000
+EXPORT_PART_MAX_BYTES = 20 * 1024**2
+EXPORT_ATTACHMENT_MAX_BYTES = 25 * 1024**2
+EXPORT_CSV_HEADER = (
+    "条目ID",
+    "时间(UTC)",
+    "操作类型",
+    "操作类型码",
+    "操作者ID",
+    "目标ID",
+    "理由",
+    "来源",
+    "完整数据",
+)
 SYNC_INTERVAL_MINUTES = bounded_env_int(
     "AUDIT_SYNC_INTERVAL_MINUTES", 10, minimum=1, maximum=1440
 )
@@ -284,6 +304,16 @@ class AuditQuery:
     upper_entry_id: Optional[int]
     page_size: int
     cursor: Optional[int] = None
+
+
+@dataclass(frozen=True, slots=True)
+class AuditExportQuery:
+    guild_id: int
+    action_type: Optional[int]
+    lower_entry_id: Optional[int]
+    upper_entry_id: Optional[int]
+    user_id: Optional[int]
+    target_id: Optional[int]
 
 
 def now_ms() -> int:
@@ -870,6 +900,91 @@ class SQLiteStore:
         ).fetchall()
         return [int(row[0]) for row in rows]
 
+    async def export_count(self, query: AuditExportQuery) -> int:
+        return int(await self._run(self._export_count, query))
+
+    def _export_count(self, query: AuditExportQuery) -> int:
+        assert self._connection is not None
+        clauses, parameters = self._export_conditions(query)
+        row = self._connection.execute(
+            f"SELECT COUNT(*) FROM audit_entries WHERE {' AND '.join(clauses)}",
+            parameters,
+        ).fetchone()
+        return int(row[0])
+
+    async def export_fetch_batch(
+        self,
+        query: AuditExportQuery,
+        last_entry_id: Optional[int],
+        batch_size: int = EXPORT_BATCH_SIZE,
+    ) -> list[dict[str, Any]]:
+        return list(
+            await self._run(
+                self._export_fetch_batch,
+                query,
+                last_entry_id,
+                batch_size,
+            )
+        )
+
+    def _export_fetch_batch(
+        self,
+        query: AuditExportQuery,
+        last_entry_id: Optional[int],
+        batch_size: int,
+    ) -> list[dict[str, Any]]:
+        assert self._connection is not None
+        if not 1 <= batch_size <= 10_000:
+            raise ValueError("export batch_size must be between 1 and 10000")
+        clauses, parameters = self._export_conditions(query)
+        if last_entry_id is not None:
+            clauses.append("entry_id > ?")
+            parameters.append(last_entry_id)
+        parameters.append(batch_size)
+        rows = self._connection.execute(
+            f"""
+            SELECT entry_id, action_type, user_id, target_id,
+                   created_at_ms, reason, payload_json, last_source
+            FROM audit_entries
+            WHERE {' AND '.join(clauses)}
+            ORDER BY entry_id ASC
+            LIMIT ?
+            """,
+            parameters,
+        ).fetchall()
+        return [
+            {
+                "entry_id": int(row[0]),
+                "action_type": int(row[1]),
+                "user_id": None if row[2] is None else int(row[2]),
+                "target_id": None if row[3] is None else int(row[3]),
+                "created_at_ms": int(row[4]),
+                "reason": row[5],
+                "payload_json": row[6],
+                "last_source": row[7],
+            }
+            for row in rows
+        ]
+
+    @staticmethod
+    def _export_conditions(
+        query: AuditExportQuery,
+    ) -> tuple[list[str], list[Any]]:
+        clauses = ["guild_id = ?"]
+        parameters: list[Any] = [query.guild_id]
+        optional_conditions = (
+            ("action_type = ?", query.action_type),
+            ("entry_id >= ?", query.lower_entry_id),
+            ("entry_id <= ?", query.upper_entry_id),
+            ("user_id = ?", query.user_id),
+            ("target_id = ?", query.target_id),
+        )
+        for clause, value in optional_conditions:
+            if value is not None:
+                clauses.append(clause)
+                parameters.append(value)
+        return clauses, parameters
+
     async def query_entries(self, query: AuditQuery) -> list[dict[str, Any]]:
         return list(await self._run(self._query_entries, query))
 
@@ -1198,6 +1313,17 @@ def resolve_subject_id(
     raise AuditInputError("请提供用户或有效的 Discord 用户 ID。")
 
 
+def parse_optional_snowflake(value: Optional[str], label: str) -> Optional[int]:
+    if value is None or not value.strip():
+        return None
+    text = value.strip()
+    if SNOWFLAKE_PATTERN.fullmatch(text):
+        snowflake = int(text)
+        if 0 < snowflake <= SQLITE_INT_MAX:
+            return snowflake
+    raise AuditInputError(f"{label} 必须是有效的 Discord ID。")
+
+
 def checked_time_snowflake(value: dt.datetime, label: str) -> int:
     try:
         snowflake = discord.utils.time_snowflake(value, high=False)
@@ -1248,6 +1374,114 @@ def parse_row_payload(row: dict[str, Any]) -> tuple[dict[str, Any], Optional[str
     if not isinstance(payload, dict):
         return {}, "payload_json 顶层不是 JSON 对象"
     return payload, None
+
+
+def export_csv_values(row: dict[str, Any]) -> tuple[Any, ...]:
+    payload, _ = parse_row_payload(row)
+    action_name = payload.get("action_name") or ACTION_NAMES.get(row["action_type"])
+    if not isinstance(action_name, str):
+        action_name = ACTION_NAMES.get(row["action_type"])
+    action_name_zh = (
+        ACTION_NAMES_ZH.get(action_name, action_name) if action_name else "未知"
+    )
+    created_at = dt.datetime.fromtimestamp(
+        row["created_at_ms"] / 1000,
+        dt.timezone.utc,
+    ).isoformat()
+    return (
+        row["entry_id"],
+        created_at,
+        action_name_zh,
+        row["action_type"],
+        "" if row["user_id"] is None else row["user_id"],
+        "" if row["target_id"] is None else row["target_id"],
+        "" if row["reason"] is None else row["reason"],
+        row["last_source"],
+        row["payload_json"],
+    )
+
+
+def encoded_csv_record(values: Iterable[Any], *, bom: bool = False) -> bytes:
+    stream = io.StringIO(newline="")
+    csv.writer(stream, lineterminator="\r\n").writerow(values)
+    text = stream.getvalue()
+    if bom:
+        text = "\ufeff" + text
+    return text.encode("utf-8")
+
+
+class ExportCsvWriter:
+    def __init__(self, directory: Path, guild_id: int) -> None:
+        self.directory = directory
+        self.guild_id = guild_id
+        self.part_number = 0
+        self.current_path: Optional[Path] = None
+        self.current_rows = 0
+        self.current_bytes = 0
+        self.header = encoded_csv_record(EXPORT_CSV_HEADER, bom=True)
+
+    def _start_part(self) -> None:
+        self.part_number += 1
+        self.current_path = self.directory / (
+            f"audit_export_{self.guild_id}_part_{self.part_number:03d}.csv"
+        )
+        self.current_path.write_bytes(self.header)
+        self.current_rows = 0
+        self.current_bytes = len(self.header)
+
+    def append_rows(self, rows: Sequence[dict[str, Any]]) -> list[Path]:
+        completed: list[Path] = []
+        output: Optional[Any] = None
+        try:
+            for row in rows:
+                record = encoded_csv_record(export_csv_values(row))
+                if len(self.header) + len(record) > EXPORT_PART_MAX_BYTES:
+                    raise ValueError(
+                        f"audit entry {row['entry_id']} exceeds the CSV part size limit"
+                    )
+                if self.current_path is None:
+                    self._start_part()
+                if self.current_rows and (
+                    self.current_rows >= EXPORT_PART_MAX_ROWS
+                    or self.current_bytes + len(record) > EXPORT_PART_MAX_BYTES
+                ):
+                    if output is not None:
+                        output.close()
+                        output = None
+                    assert self.current_path is not None
+                    completed.append(self.current_path)
+                    self._start_part()
+                if output is None:
+                    assert self.current_path is not None
+                    output = self.current_path.open("ab")
+                output.write(record)
+                self.current_rows += 1
+                self.current_bytes += len(record)
+        finally:
+            if output is not None:
+                output.close()
+        return completed
+
+    def finish(self) -> list[Path]:
+        if self.current_path is None or self.current_rows == 0:
+            return []
+        completed = [self.current_path]
+        self.current_path = None
+        self.current_rows = 0
+        self.current_bytes = 0
+        return completed
+
+
+def zip_export_csv(csv_path: Path) -> Path:
+    zip_path = csv_path.with_suffix(".zip")
+    with zipfile.ZipFile(
+        zip_path,
+        mode="w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=6,
+    ) as archive:
+        archive.write(csv_path, arcname=csv_path.name)
+    return zip_path
 
 
 def row_field(row: dict[str, Any]) -> tuple[str, str]:
@@ -1847,6 +2081,68 @@ class AuditCommands(app_commands.Group):
             page_size=page_size,
         )
 
+    @app_commands.command(name="export", description="导出归档审核日志为 CSV 文件")
+    @app_commands.describe(
+        after="起始时间（含），ISO-8601 格式",
+        before="结束时间（不含），ISO-8601 格式",
+        action_type="按操作类型筛选，可输入中文关键词或数字搜索",
+        user_id="按操作者 ID 筛选",
+        target_id="按目标 ID 筛选",
+    )
+    @app_commands.autocomplete(action_type=audit_action_autocomplete)
+    @audit_authorized()
+    async def export(
+        self,
+        interaction: discord.Interaction,
+        after: Optional[str] = None,
+        before: Optional[str] = None,
+        action_type: Optional[int] = None,
+        user_id: Optional[str] = None,
+        target_id: Optional[str] = None,
+    ) -> None:
+        if interaction.guild_id is None:
+            raise AuditInputError("本命令仅限服务器内使用。")
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        lower, upper = make_time_bounds(after, before)
+        if action_type is not None and action_type < 0:
+            raise AuditInputError("action_type 必须是非负整数。")
+        actor_id = parse_optional_snowflake(user_id, "user_id")
+        subject_id = parse_optional_snowflake(target_id, "target_id")
+        query = AuditExportQuery(
+            guild_id=interaction.guild_id,
+            action_type=action_type,
+            lower_entry_id=lower,
+            upper_entry_id=upper,
+            user_id=actor_id,
+            target_id=subject_id,
+        )
+        total_count = await self.client.store.export_count(query)
+        if total_count == 0:
+            await interaction.edit_original_response(content="没有匹配的归档日志。")
+            return
+        started = await self.client.run_export(
+            interaction.guild_id,
+            interaction.user,
+            after=after,
+            before=before,
+            action_type=action_type,
+            user_id=user_id,
+            target_id=target_id,
+            interaction=interaction,
+            total_count=total_count,
+        )
+        if not started:
+            await interaction.edit_original_response(
+                content="本服务器已有导出任务正在运行，请稍后再试。"
+            )
+            return
+        await interaction.edit_original_response(
+            content=(
+                f"已开始导出，共 {total_count:,} 条，"
+                "完成后将通过私信发送 CSV 文件。"
+            )
+        )
+
     @app_commands.command(name="role-add", description="授权身份组使用审核日志查询命令")
     @app_commands.describe(role="要授权的身份组")
     @guild_owner_only()
@@ -2146,6 +2442,7 @@ class AuditArchiver(discord.Client):
         self.accepting_events = True
         self.role_cache: dict[int, tuple[float, frozenset[int]]] = {}
         self.backfill_tasks: dict[int, asyncio.Task[None]] = {}
+        self.export_tasks: dict[int, asyncio.Task[None]] = {}
         self.tree = app_commands.CommandTree(self)
         self.tree.add_command(AuditCommands(self))
 
@@ -2260,6 +2557,181 @@ class AuditArchiver(discord.Client):
             return True
         allowed = await self.authorized_role_ids(interaction.guild_id)
         return any(role.id in allowed for role in member.roles)
+
+    async def run_export(
+        self,
+        guild_id: int,
+        requester: discord.abc.Messageable,
+        *,
+        after: Optional[str],
+        before: Optional[str],
+        action_type: Optional[int],
+        user_id: Optional[str],
+        target_id: Optional[str],
+        interaction: discord.Interaction,
+        total_count: int,
+    ) -> bool:
+        existing = self.export_tasks.get(guild_id)
+        if existing is not None and not existing.done():
+            return False
+        lower, upper = make_time_bounds(after, before)
+        query = AuditExportQuery(
+            guild_id=guild_id,
+            action_type=action_type,
+            lower_entry_id=lower,
+            upper_entry_id=upper,
+            user_id=parse_optional_snowflake(user_id, "user_id"),
+            target_id=parse_optional_snowflake(target_id, "target_id"),
+        )
+        task = asyncio.create_task(
+            self._export_csv(
+                query,
+                requester,
+                interaction,
+                total_count,
+            ),
+            name=f"audit-csv-export:{guild_id}:{interaction.user.id}",
+        )
+        self.export_tasks[guild_id] = task
+        task.add_done_callback(
+            lambda finished, export_guild_id=guild_id: self.finish_export(
+                export_guild_id,
+                finished,
+            )
+        )
+        return True
+
+    def finish_export(self, guild_id: int, task: asyncio.Task[None]) -> None:
+        if self.export_tasks.get(guild_id) is task:
+            self.export_tasks.pop(guild_id, None)
+        if task.cancelled():
+            LOG.warning("Audit CSV export cancelled for guild %s", guild_id)
+            return
+        error = task.exception()
+        if error is not None:
+            LOG.error(
+                "Audit CSV export task failed for guild %s",
+                guild_id,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    async def _export_csv(
+        self,
+        query: AuditExportQuery,
+        requester: discord.abc.Messageable,
+        interaction: discord.Interaction,
+        total_count: int,
+    ) -> None:
+        temporary_directory: Optional[Path] = None
+        try:
+            temporary_directory = Path(
+                tempfile.mkdtemp(prefix=f"audit-export-{query.guild_id}-")
+            )
+            writer = ExportCsvWriter(temporary_directory, query.guild_id)
+            last_entry_id: Optional[int] = None
+            exported_count = 0
+            sent_parts = 0
+            dm_available = True
+            while exported_count < total_count:
+                rows = await self.store.export_fetch_batch(
+                    query,
+                    last_entry_id,
+                    min(EXPORT_BATCH_SIZE, total_count - exported_count),
+                )
+                if not rows:
+                    break
+                completed = await asyncio.to_thread(writer.append_rows, rows)
+                exported_count += len(rows)
+                last_entry_id = rows[-1]["entry_id"]
+                for csv_path in completed:
+                    sent_parts += 1
+                    dm_available = await self._send_export_part(
+                        requester,
+                        interaction,
+                        csv_path,
+                        sent_parts,
+                        total_count,
+                        dm_available,
+                    )
+                await asyncio.sleep(0)
+
+            for csv_path in await asyncio.to_thread(writer.finish):
+                sent_parts += 1
+                dm_available = await self._send_export_part(
+                    requester,
+                    interaction,
+                    csv_path,
+                    sent_parts,
+                    total_count,
+                    dm_available,
+                )
+            if exported_count == 0:
+                with contextlib.suppress(discord.HTTPException):
+                    await interaction.followup.send(
+                        "导出期间匹配记录已发生变化，当前没有可导出的日志。",
+                        ephemeral=True,
+                    )
+            LOG.info(
+                "Audit CSV export completed guild=%s rows=%s expected=%s parts=%s",
+                query.guild_id,
+                exported_count,
+                total_count,
+                sent_parts,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            LOG.exception("Audit CSV export failed for guild %s", query.guild_id)
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.followup.send(
+                    f"CSV 导出失败：{type(exc).__name__}。请联系管理员查看日志。",
+                    ephemeral=True,
+                )
+        finally:
+            if temporary_directory is not None:
+                await asyncio.to_thread(shutil.rmtree, temporary_directory, True)
+
+    async def _send_export_part(
+        self,
+        requester: discord.abc.Messageable,
+        interaction: discord.Interaction,
+        csv_path: Path,
+        part_number: int,
+        total_count: int,
+        dm_available: bool,
+    ) -> bool:
+        zip_path = await asyncio.to_thread(zip_export_csv, csv_path)
+        try:
+            zip_size = zip_path.stat().st_size
+            if zip_size >= EXPORT_ATTACHMENT_MAX_BYTES:
+                raise RuntimeError(
+                    f"compressed export part exceeds attachment limit: {zip_size}"
+                )
+            content = f"审核日志 CSV 导出，第 {part_number} 部分，共 {total_count:,} 条。"
+            if dm_available:
+                attachment = discord.File(zip_path, filename=zip_path.name)
+                try:
+                    await requester.send(content, file=attachment)
+                    return True
+                except discord.Forbidden:
+                    dm_available = False
+                finally:
+                    attachment.close()
+            attachment = discord.File(zip_path, filename=zip_path.name)
+            try:
+                await interaction.followup.send(
+                    "私信未开启，已在此处发送。\n" + content,
+                    file=attachment,
+                    ephemeral=False,
+                )
+            finally:
+                attachment.close()
+            return dm_available
+        finally:
+            with contextlib.suppress(OSError):
+                csv_path.unlink()
+            with contextlib.suppress(OSError):
+                zip_path.unlink()
 
     def start_manual_backfill(
         self, guild: discord.Guild, full: bool
@@ -2737,6 +3209,14 @@ class AuditArchiver(discord.Client):
             with contextlib.suppress(asyncio.CancelledError):
                 await manual_task
         self.backfill_tasks.clear()
+
+        export_tasks = list(self.export_tasks.values())
+        for export_task in export_tasks:
+            export_task.cancel()
+        for export_task in export_tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await export_task
+        self.export_tasks.clear()
 
         await super().close()
 
