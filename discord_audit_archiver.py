@@ -67,7 +67,7 @@ EXPORT_PART_MAX_BYTES = 20 * 1024**2
 EXPORT_ATTACHMENT_MAX_BYTES = 25 * 1024**2
 EXPORT_CSV_HEADER = (
     "条目ID",
-    "时间(UTC)",
+    "时间(北京时间)",
     "操作类型",
     "操作类型码",
     "操作者ID",
@@ -1390,7 +1390,7 @@ def export_csv_values(row: dict[str, Any]) -> tuple[Any, ...]:
     created_at = dt.datetime.fromtimestamp(
         row["created_at_ms"] / 1000,
         dt.timezone.utc,
-    ).strftime("%Y-%m-%d %H:%M:%S")
+    ).astimezone(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
     return (
         row["entry_id"],
         created_at,
