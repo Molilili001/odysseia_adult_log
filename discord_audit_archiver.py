@@ -304,6 +304,7 @@ class AuditQuery:
     upper_entry_id: Optional[int]
     page_size: int
     cursor: Optional[int] = None
+    target_id: Optional[int] = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1007,6 +1008,9 @@ class SQLiteStore:
         if query.cursor is not None:
             clauses.append("entry_id < ?")
             parameters.append(query.cursor)
+        if getattr(query, "target_id", None) is not None and query.filter_column != "target_id":
+            clauses.append("target_id = ?")
+            parameters.append(query.target_id)
 
         parameters.append(query.page_size + 1)
         sql = f"""
@@ -2083,6 +2087,56 @@ class AuditCommands(app_commands.Group):
             before=before,
             page_size=page_size,
         )
+
+    @app_commands.command(name="by-actor-target", description="查询指定操作者对指定目标执行的审核操作")
+    @app_commands.describe(
+        actor="选择操作者（当前服务器中的用户）",
+        actor_id="操作者 ID，适用于已离开服务器的用户",
+        target="选择目标用户",
+        target_id="目标用户 ID，适用于已离开服务器的用户",
+        action_type="按操作类型筛选，可输入中文关键词或数字搜索，例如：封禁、身份组、子区、51",
+        after="起始时间（含），例如 2026-08-17 15:30，默认北京时间",
+        before="结束时间（不含），例如 2026-08-17 15:30，默认北京时间",
+        page_size="每页结果数，范围 5–15",
+    )
+    @app_commands.autocomplete(action_type=audit_action_autocomplete)
+    @audit_authorized()
+    async def by_actor_target(
+        self,
+        interaction: discord.Interaction,
+        actor: Optional[discord.User] = None,
+        actor_id: Optional[str] = None,
+        target: Optional[discord.User] = None,
+        target_id: Optional[str] = None,
+        action_type: Optional[int] = None,
+        after: Optional[str] = None,
+        before: Optional[str] = None,
+        page_size: int = 10,
+    ) -> None:
+        if interaction.guild_id is None:
+            raise AuditInputError("本命令仅限服务器内使用。")
+        if not 5 <= page_size <= 15:
+            raise AuditInputError("page_size 必须在 5 到 15 之间。")
+        if action_type is not None and action_type < 0:
+            raise AuditInputError("action_type 必须是非负整数。")
+        actor_subject = resolve_subject_id(actor, actor_id)
+        target_subject = resolve_subject_id(target, target_id)
+        lower, upper = make_time_bounds(after, before)
+        query = AuditQuery(
+            guild_id=interaction.guild_id,
+            filter_column="user_id",
+            subject_id=actor_subject,
+            action_type=action_type,
+            lower_entry_id=lower,
+            upper_entry_id=upper,
+            page_size=page_size,
+            target_id=target_subject,
+        )
+        title = f"审核日志查询 · 操作者 {actor_subject} → 目标 {target_subject}"
+        view = AuditPageView(self.client, interaction.user.id, query, title)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.edit_original_response(embed=await view.build_embed(), view=view)
+        view.message = await interaction.original_response()
 
     @app_commands.command(name="export", description="导出归档审核日志为 CSV 文件")
     @app_commands.describe(
